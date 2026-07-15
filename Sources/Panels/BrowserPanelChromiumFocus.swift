@@ -19,6 +19,15 @@ extension BrowserPanel {
         guard let chromiumView = chromiumWebContentView,
               let window = chromiumView.window,
               !chromiumView.isHiddenOrHasHiddenAncestor else { return }
+        // If nothing meaningful is loaded yet, prefer letting the omnibar take
+        // focus (parity with the WebKit blank-page guard in focus()). Without
+        // this, pane focus steals first responder from the just-autofocused
+        // omnibar on a fresh about:blank surface. `isLoading` mirrors the
+        // chromium model; `preferredURLStringForOmnibar()` is nil exactly when
+        // neither the model nor a pending navigation recorded a nonblank URL.
+        if !isLoading, preferredURLStringForOmnibar() == nil {
+            return
+        }
         if Self.responderChainContains(window.firstResponder, target: chromiumView) {
             noteWebViewFocused()
             return
