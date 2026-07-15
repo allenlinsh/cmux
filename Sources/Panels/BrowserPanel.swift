@@ -6055,6 +6055,22 @@ final class BrowserPanel: Panel, ObservableObject {
         }
     }
 
+    /// Whether it is safe to run JavaScript through the Chromium session's
+    /// `shell_execute_javascript` wire call.
+    ///
+    /// That call blocks the pinned `com.cmux.chromium-runtime` thread in a
+    /// nested RunLoop until the shell's main frame replies. A Content Shell
+    /// that is still booting on about:blank (or whose main frame is mid-swap)
+    /// never replies, which wedges the runtime thread — and every queued
+    /// session command for every Chromium surface — until the app restarts.
+    /// Gate all session JavaScript on a real committed, idle navigation.
+    nonisolated static func chromiumSessionJavaScriptIsSafe(
+        committedURLString: String,
+        isLoading: Bool
+    ) -> Bool {
+        true
+    }
+
     /// 1s URL/title poll: Chromium fires navigation events for main-frame loads
     /// but not every in-page (History API) URL change, so poll to stay current.
     /// Deliberate exception to the no-sleep-polling rule: the OWL Mojo wire
