@@ -634,8 +634,6 @@ enum BrowserSurfaceEngineKind: String, Codable, Sendable {
 }
 
 extension BrowserEngineSettings {
-    @MainActor private static var didNotifyFallback = false
-
     /// Engine kind for a newly created (non-restored) surface, posting the
     /// once-per-run fallback notification when a Chromium request degrades to WebKit.
     @MainActor
@@ -647,7 +645,7 @@ extension BrowserEngineSettings {
             runtimeAvailable: runtimeAvailable
         )
         if resolution.didFallBack {
-            postFallbackNotificationIfNeeded(workspaceId: workspaceId)
+            ChromiumRuntimeManager.shared.postFallbackNotificationIfNeeded(workspaceId: workspaceId)
         }
         return resolution.kind
     }
@@ -660,27 +658,8 @@ extension BrowserEngineSettings {
         if ChromiumRuntimeManager.shared.isRuntimeAvailable() {
             return .chromium
         }
-        postFallbackNotificationIfNeeded(workspaceId: workspaceId)
+        ChromiumRuntimeManager.shared.postFallbackNotificationIfNeeded(workspaceId: workspaceId)
         return .webkit
-    }
-
-    @MainActor
-    static func postFallbackNotificationIfNeeded(workspaceId: UUID) {
-        guard !didNotifyFallback else { return }
-        didNotifyFallback = true
-        TerminalNotificationStore.shared.addNotification(
-            tabId: workspaceId,
-            surfaceId: nil,
-            title: String(
-                localized: "chromium.fallback.title",
-                defaultValue: "Chromium unavailable — using WebKit"
-            ),
-            subtitle: "",
-            body: String(
-                localized: "chromium.fallback.body",
-                defaultValue: "Install a runtime with scripts/fetch-chromium-runtime.sh, then open a new browser surface."
-            )
-        )
     }
 }
 
@@ -2834,16 +2813,16 @@ final class BrowserPanel: Panel, ObservableObject {
     /// True after the Chromium browser process ended; reload restarts a fresh session.
     @Published private(set) var chromiumDisconnected: Bool = false
 
-#if DEBUG
     /// Test-only stand-in for the chromium engine's content view so focus
     /// behavior is exercisable without a live Content Shell session.
+    /// Reached via `@testable import`; only tests assign it.
     var chromiumWebContentViewOverrideForTesting: NSView?
 
     /// Test seam: when set, `activateChromiumIfNeeded` reports the initial URL
     /// and `--proxy-server` value it would launch the Content Shell with, then
     /// returns without acquiring a real session.
+    /// Reached via `@testable import`; only tests assign it.
     var chromiumActivationInterceptorForTesting: ((_ initialURL: String, _ proxyServer: String?) -> Void)?
-#endif
 
     /// Tracks whether the Chromium runtime's DevTools panel is currently open, so
     /// the shared Toggle Developer Tools action can drive open/close on `.chromium`.
@@ -5902,13 +5881,11 @@ final class BrowserPanel: Panel, ObservableObject {
         let rawInitialURL = pendingInitialChromiumURL ?? blankURLString
         let initialURL = chromiumOutboundURLString(rawInitialURL)
         let requestedProfileID = profileID
-#if DEBUG
         if let interceptor = chromiumActivationInterceptorForTesting {
             chromiumActivationInProgress = false
             interceptor(initialURL, proxyServer)
             return
         }
-#endif
         Task { @MainActor in
             do {
                 let (session, model, webView) = try await ChromiumRuntimeManager.shared.acquireSession(
@@ -5947,7 +5924,7 @@ final class BrowserPanel: Panel, ObservableObject {
                 if let fallbackURL = URL(string: fallbackURLString) {
                     self.navigate(to: fallbackURL)
                 }
-                BrowserEngineSettings.postFallbackNotificationIfNeeded(workspaceId: self.workspaceId)
+                ChromiumRuntimeManager.shared.postFallbackNotificationIfNeeded(workspaceId: self.workspaceId)
             }
         }
     }
@@ -6080,6 +6057,10 @@ final class BrowserPanel: Panel, ObservableObject {
 
     /// 1s URL/title poll: Chromium fires navigation events for main-frame loads
     /// but not every in-page (History API) URL change, so poll to stay current.
+    /// Deliberate exception to the no-sleep-polling rule: the OWL Mojo wire
+    /// exposes no pushState/replaceState or SPA-navigation event today.
+    /// TODO: retire this timer once the runtime surfaces a dedicated
+    /// navigation/URL-change hook (tracked with the CmuxChromium runtime work).
     private func startChromiumPoll(_ state: BrowserPanelChromiumState) {
         state.pollTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {

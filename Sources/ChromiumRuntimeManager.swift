@@ -10,8 +10,32 @@ final class ChromiumRuntimeManager {
     // Chromium cannot be unloaded; the runtime lives for the process.
     private var runtime: ChromiumRuntime?
 
+    /// Once-per-run guard for the Chromium→WebKit fallback notification, owned
+    /// here (with the runtime lifecycle) rather than as ambient global state.
+    private var didNotifyFallback = false
+
     func isRuntimeAvailable() -> Bool {
         (try? ChromiumRuntimeLocator().locate()) != nil
+    }
+
+    /// Posts the "Chromium unavailable — using WebKit" notification at most
+    /// once per app run, no matter how many surfaces degrade.
+    func postFallbackNotificationIfNeeded(workspaceId: UUID) {
+        guard !didNotifyFallback else { return }
+        didNotifyFallback = true
+        TerminalNotificationStore.shared.addNotification(
+            tabId: workspaceId,
+            surfaceId: nil,
+            title: String(
+                localized: "chromium.fallback.title",
+                defaultValue: "Chromium unavailable — using WebKit"
+            ),
+            subtitle: "",
+            body: String(
+                localized: "chromium.fallback.body",
+                defaultValue: "Install a runtime with scripts/fetch-chromium-runtime.sh, then open a new browser surface."
+            )
+        )
     }
 
     func acquireSession(
