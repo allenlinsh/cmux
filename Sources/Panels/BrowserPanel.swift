@@ -6055,6 +6055,33 @@ final class BrowserPanel: Panel, ObservableObject {
         }
     }
 
+    /// Whether it is safe to run JavaScript through the Chromium session's
+    /// `shell_execute_javascript` wire call.
+    ///
+    /// That call blocks the pinned `com.cmux.chromium-runtime` thread in a
+    /// nested RunLoop until the shell's main frame replies. A Content Shell
+    /// that is still booting on about:blank (or whose main frame is mid-swap)
+    /// never replies, which wedges the runtime thread — and every queued
+    /// session command for every Chromium surface — until the app restarts.
+    /// Gate all session JavaScript on a real committed, idle navigation.
+    nonisolated static func chromiumSessionJavaScriptIsSafe(
+        committedURLString: String,
+        isLoading: Bool
+    ) -> Bool {
+        guard !isLoading else { return false }
+        let trimmed = committedURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed != "about:blank"
+    }
+
+    /// `chromiumSessionJavaScriptIsSafe` evaluated against the live session's
+    /// model, for the poll and the history/reload JavaScript shims.
+    private func chromiumSessionJavaScriptIsSafe(_ state: BrowserPanelChromiumState) -> Bool {
+        Self.chromiumSessionJavaScriptIsSafe(
+            committedURLString: state.model.currentURL,
+            isLoading: state.model.isLoading
+        )
+    }
+
     /// 1s URL/title poll: Chromium fires navigation events for main-frame loads
     /// but not every in-page (History API) URL change, so poll to stay current.
     /// Deliberate exception to the no-sleep-polling rule: the OWL Mojo wire
@@ -6067,6 +6094,7 @@ final class BrowserPanel: Panel, ObservableObject {
                 try? await Task.sleep(for: .seconds(1))
                 if Task.isCancelled { return }
                 guard let self, self.chromium === state, !self.chromiumDisconnected else { return }
+                guard self.chromiumSessionJavaScriptIsSafe(state) else { continue }
                 let session = state.session
                 let href = try? await session.executeJavaScript("window.location.href")
                 let title = try? await session.executeJavaScript("document.title")
@@ -6712,7 +6740,8 @@ extension BrowserPanel {
     /// Go back in history
     func goBack() {
         if engineKind == .chromium {
-            if let session = chromium?.session, !chromiumDisconnected {
+            if let state = chromium, !chromiumDisconnected, chromiumSessionJavaScriptIsSafe(state) {
+                let session = state.session
                 Task { _ = try? await session.executeJavaScript("history.back()") }
             }
             return
@@ -6750,7 +6779,8 @@ extension BrowserPanel {
     /// Go forward in history
     func goForward() {
         if engineKind == .chromium {
-            if let session = chromium?.session, !chromiumDisconnected {
+            if let state = chromium, !chromiumDisconnected, chromiumSessionJavaScriptIsSafe(state) {
+                let session = state.session
                 Task { _ = try? await session.executeJavaScript("history.forward()") }
             }
             return
@@ -6892,14 +6922,30 @@ extension BrowserPanel {
         return false
     }
 
+    /// Chromium reload path shared by `reload()` and `hardReload()`. When the
+    /// session has no committed navigation (JS would wedge the runtime thread,
+    /// see `chromiumSessionJavaScriptIsSafe`), retry the recorded URL through
+    /// the navigate wire call instead — reload is the user's natural recovery
+    /// action on a tab stuck before its first commit.
+    private func chromiumReload(javaScript: String) {
+        if chromiumDisconnected {
+            restartChromiumAfterDisconnect()
+            return
+        }
+        guard let state = chromium else { return }
+        let session = state.session
+        if chromiumSessionJavaScriptIsSafe(state) {
+            Task { _ = try? await session.executeJavaScript(javaScript) }
+        } else if let target = lastMirroredChromiumURL ?? currentURL?.absoluteString {
+            let outboundURL = chromiumOutboundURLString(target)
+            Task { try? await session.navigate(to: outboundURL) }
+        }
+    }
+
     /// Reload the current page
     func reload() {
         if engineKind == .chromium {
-            if chromiumDisconnected {
-                restartChromiumAfterDisconnect()
-            } else if let session = chromium?.session {
-                Task { _ = try? await session.executeJavaScript("location.reload()") }
-            }
+            chromiumReload(javaScript: "location.reload()")
             return
         }
         if prepareForReload(reason: "reload", mode: .soft) {
@@ -6915,11 +6961,7 @@ extension BrowserPanel {
     /// Reload the current page, bypassing WebKit's cache.
     func hardReload() {
         if engineKind == .chromium {
-            if chromiumDisconnected {
-                restartChromiumAfterDisconnect()
-            } else if let session = chromium?.session {
-                Task { _ = try? await session.executeJavaScript("location.reload(true)") }
-            }
+            chromiumReload(javaScript: "location.reload(true)")
             return
         }
         if prepareForReload(reason: "hardReload", mode: .hard) {
