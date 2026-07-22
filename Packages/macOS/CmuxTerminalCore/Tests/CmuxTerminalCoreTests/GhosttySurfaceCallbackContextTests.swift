@@ -1,11 +1,12 @@
 import Foundation
 import Testing
+import CmuxFoundation
 import CmuxTerminalCore
 import GhosttyKit
 
 private final class FakeSurfaceController: TerminalSurfaceControlling {
     let surfaceId: UUID
-    var owningTabId: UUID
+    let owningTabId: UUID
     var runtimeSurfacePointer: ghostty_surface_t?
 
     init(
@@ -42,24 +43,6 @@ private final class FakeSurfaceHost: TerminalSurfaceHosting {
         )
         #expect(context.surfaceId == controller.surfaceId)
         #expect(context.tabId == controller.owningTabId)
-    }
-
-    @Test func rendererProfilingIdentitySurvivesOwnerChangesAndRelease() {
-        let surfaceId = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
-        let workspaceId = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
-        var controller: FakeSurfaceController? = FakeSurfaceController(surfaceId: surfaceId, owningTabId: workspaceId)
-        var host: FakeSurfaceHost? = FakeSurfaceHost()
-        let context = GhosttySurfaceCallbackContext(
-            surfaceHost: host!,
-            surfaceController: controller!
-        )
-
-        controller?.owningTabId = UUID()
-        controller = nil
-        host = nil
-
-        #expect(context.rendererProfilingIdentity.surfaceId == surfaceId)
-        #expect(context.rendererProfilingIdentity.workspaceId == workspaceId)
     }
 
     @Test func tabIdFallsBackToHostWhenControllerReleased() {
@@ -109,5 +92,30 @@ private final class FakeSurfaceHost: TerminalSurfaceHosting {
         host = nil
         #expect(context.runtimeSurface == nil)
         #expect(context.tabId == nil)
+    }
+
+    @Test func rendererRepairSignalCoalescesUntilRearmed() {
+        let controller = FakeSurfaceController()
+        let host = FakeSurfaceHost()
+        let expectedSurfaceID = controller.surfaceId
+        let callbackCount = AtomicUInt64Generation()
+        let context = GhosttySurfaceCallbackContext(
+            surfaceHost: host,
+            surfaceController: controller,
+            rendererMailboxDidDrain: { surfaceID in
+                #expect(surfaceID == expectedSurfaceID)
+                _ = callbackCount.advanceRelaxed()
+            }
+        )
+
+        context.rendererMailboxDidDrain()
+        context.armRendererPresentationRepair()
+        context.rendererMailboxDidDrain()
+        context.rendererMailboxDidDrain()
+        context.armRendererPresentationRepair()
+        context.cancelRendererPresentationRepair()
+        context.rendererMailboxDidDrain()
+
+        #expect(callbackCount.loadRelaxed() == 1)
     }
 }

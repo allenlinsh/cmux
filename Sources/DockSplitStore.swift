@@ -3,7 +3,9 @@ import Bonsplit
 import Combine
 import CmuxAppKitSupportUI
 import CmuxCore
+import CmuxSettings
 import CmuxTerminal
+import CmuxWorkspaces
 import Observation
 import SwiftUI
 
@@ -32,7 +34,6 @@ final class DockSplitStore: BonsplitDelegate {
     private let baseDirectoryProvider: () -> String?
     private let remoteBrowserSettingsProvider: () -> DockRemoteBrowserSettings
     private let browserAvailabilityProvider: () -> Bool
-    // Internal so cross-container transfers can move live panels without tearing them down.
     var panels: [UUID: any Panel] = [:]
     var surfaceIdToPanelId: [TabID: UUID] = [:]
     var panelCancellables: [UUID: AnyCancellable] = [:]
@@ -60,6 +61,9 @@ final class DockSplitStore: BonsplitDelegate {
     @ObservationIgnored var tabCloseButtonCloseDockTabIds: Set<TabID> = []
     @ObservationIgnored var terminalViewReattachCoalescingDepth = 0
     @ObservationIgnored var pendingTerminalViewReattachPanelIds: Set<UUID> = []
+    @ObservationIgnored let focusHistoryNavigation: any FocusHistoryNavigating
+    private let settings: any SettingsReading
+    private let settingsCatalog = SettingCatalog()
 
     /// Weak registry of every live Dock store. Lets control-surface routing
     /// resolve a Dock surface/pane by querying only the workspaces that actually
@@ -68,7 +72,6 @@ final class DockSplitStore: BonsplitDelegate {
     /// automatically when a store deallocates; accessed on the main actor only.
     @MainActor private static let liveStoresTable = NSHashTable<DockSplitStore>.weakObjects()
 
-    /// Snapshot of the currently live Dock stores.
     @MainActor static var liveStores: [DockSplitStore] { liveStoresTable.allObjects }
 
     init(
@@ -76,13 +79,19 @@ final class DockSplitStore: BonsplitDelegate {
         scope: DockScope = .workspace,
         baseDirectoryProvider: @escaping () -> String?,
         remoteBrowserSettingsProvider: @escaping () -> DockRemoteBrowserSettings = { .local },
-        browserAvailabilityProvider: @escaping () -> Bool = { BrowserAvailabilitySettings.isEnabled() }
+        browserAvailabilityProvider: @escaping () -> Bool = { BrowserAvailabilitySettings.isEnabled() },
+        settings: any SettingsReading = UserDefaultsSettingsClient(defaults: .standard)
     ) {
         self.workspaceId = workspaceId
         self.scope = scope
         self.baseDirectoryProvider = baseDirectoryProvider
         self.remoteBrowserSettingsProvider = remoteBrowserSettingsProvider
         self.browserAvailabilityProvider = browserAvailabilityProvider
+        self.settings = settings
+        let focusHistoryScopeKey = SettingCatalog().app.focusHistoryIncludesPanesAndTabs
+        self.focusHistoryNavigation = FocusHistoryModel(navigationScope: {
+            settings.value(for: focusHistoryScopeKey) ? .panesAndTabs : .workspacesOnly
+        })
         self.bonsplitController = BonsplitController(configuration: Self.makeConfiguration())
         self.sourceLabel = String(localized: "dock.source.title", defaultValue: "Dock")
         self.bonsplitController.delegate = self
@@ -115,8 +124,12 @@ final class DockSplitStore: BonsplitDelegate {
         for tabId in bonsplitController.allTabIds {
             _ = bonsplitController.closeTab(tabId)
         }
-        // Register only after every stored property is initialized.
+        focusHistoryNavigation.attach(host: self)
         Self.liveStoresTable.add(self)
+    }
+
+    var focusHistoryIncludesPanesAndTabs: Bool {
+        settings.value(for: settingsCatalog.app.focusHistoryIncludesPanesAndTabs)
     }
 
     // MARK: - Lookups

@@ -10,12 +10,11 @@ import AppKit
 #endif
 
 struct DisconnectedWorkspaceShellView: View {
-    /// Whether this install has ever paired a Mac. Gates the
-    /// Tailscale-inactive callout: its copy explains an unreachable Mac, which
-    /// is misleading for a signed-in user who has not added a device yet (that
-    /// user gets the pairing-flavored callout in the auto-presented sheet).
+    /// Whether this install has ever paired a Mac. Used to distinguish first
+    /// setup from reconnect guidance.
     let hasKnownPairedMac: Bool
     let showAddDevice: () -> Void
+    let showPairingScanner: () -> Void
     let signOut: () -> Void
     /// The setup gate to highlight in the "Trouble connecting?" help (iOS only).
     /// The root passes `.macUnreachable` for a returning device whose stored Mac
@@ -28,9 +27,8 @@ struct DisconnectedWorkspaceShellView: View {
     /// Mac reconnect fails). `nil` in previews.
     var store: CMUXMobileShellStore?
 
-    @Environment(\.tailscaleStatusMonitor) private var tailscaleStatusMonitor
-
     @State private var showingSettings = false
+    @State private var settingsPairingScannerHandoff = SettingsPairingScannerHandoff()
 
     #if os(iOS)
     @State private var isShowingSetupHelp = false
@@ -103,7 +101,9 @@ struct DisconnectedWorkspaceShellView: View {
             // this device has paired a Mac before (offline recovery) or not.
             SetupHelpView(highlight: setupHelpHighlight) { isShowingSetupHelp = false }
         }
-        .sheet(isPresented: $showingSettings) {
+        .sheet(isPresented: $showingSettings, onDismiss: {
+            settingsPairingScannerHandoff.settingsDidDismiss(startScanner: showPairingScanner)
+        }) {
             // Reuse the same Settings sheet the workspace list opens from its
             // Settings button so the no-devices screen's chrome matches. There is no
             // connected host or QR to rescan here, but the store is forwarded so
@@ -112,6 +112,11 @@ struct DisconnectedWorkspaceShellView: View {
             MobileSettingsView(
                 connectedHostName: "",
                 rescanQR: nil,
+                startPairingScanner: {
+                    settingsPairingScannerHandoff.requestScannerAfterDismiss(
+                        isSettingsPresented: $showingSettings
+                    )
+                },
                 signOut: signOut,
                 store: store
             )
@@ -125,10 +130,7 @@ struct DisconnectedWorkspaceShellView: View {
         ) {
             Button(L10n.string("mobile.common.ok", defaultValue: "OK"), role: .cancel) {}
         } message: {
-            Text(L10n.string(
-                "mobile.disconnected.connectFailedMessage",
-                defaultValue: "Make sure the computer is awake and online, then try again."
-            ))
+            Text(connectFailedMessage)
         }
         #endif
     }
@@ -156,24 +158,16 @@ struct DisconnectedWorkspaceShellView: View {
     /// ``MacComputerSnapshot`` values and closures only, never the store.
     private func savedComputersList(_ computers: [MacComputerSnapshot]) -> some View {
         List {
-            // When a paired Mac is unreachable and this device has no active
-            // tailnet, lead with that explanation instead of leaving the user
-            // to tap dead rows.
-            if hasKnownPairedMac, tailscaleStatusMonitor?.status == .inactiveOrNotInstalled {
-                Section {
-                    TailscaleInactiveCallout(context: .disconnected)
-                }
-            }
             Section {
                 ForEach(computers) { computer in
                     MacComputerRow(
                         computer: computer,
                         requestRemove: { computerPendingRemovalID = $0 },
-                        isConfirmingRemove: removalConfirmationBinding(for: computer.deviceId),
+                        isConfirmingRemove: removalConfirmationBinding(for: computer.id),
                         confirmRemove: { _ in confirmComputerRemoval() },
                         style: .reconnect,
-                        connect: { connect(to: $0, named: computer.title) },
-                        isConnecting: connectingMacID == computer.deviceId
+                        connect: { _ in connect(to: computer) },
+                        isConnecting: connectingMacID == computer.id
                     )
                 }
             } header: {
@@ -227,11 +221,6 @@ struct DisconnectedWorkspaceShellView: View {
                 defaultValue: "Add a computer to start syncing terminal workspaces."
             ))
         } actions: {
-            if hasKnownPairedMac, tailscaleStatusMonitor?.status == .inactiveOrNotInstalled {
-                TailscaleInactiveCallout(context: .disconnected)
-                    .frame(maxWidth: 320, alignment: .leading)
-                    .padding(.bottom, 4)
-            }
             Button(action: showAddDevice) {
                 Text(L10n.string("mobile.addDevice.title", defaultValue: "Add Computer"))
             }
@@ -255,16 +244,19 @@ struct DisconnectedWorkspaceShellView: View {
     /// switch (e.g. from the Settings sheet's host picker) supersedes this one;
     /// in that case the newer attempt is still in flight or has already
     /// connected, and alerting "couldn't connect" would be wrong — skip it.
-    private func connect(to macDeviceID: String, named name: String) {
+    private func connect(to computer: MacComputerSnapshot) {
         guard connectingMacID == nil, let store else { return }
-        connectingMacID = macDeviceID
+        connectingMacID = computer.id
         Task {
-            let connected = await store.switchToMac(macDeviceID: macDeviceID)
+            let connected = await store.switchToMac(
+                macDeviceID: computer.deviceId,
+                instanceTag: computer.instanceTag
+            )
             connectingMacID = nil
             if !connected,
                store.connectionState != .connected,
                !store.isMacSwitchInFlight {
-                connectFailedComputerName = name
+                connectFailedComputerName = computer.title
             }
         }
     }
@@ -276,6 +268,21 @@ struct DisconnectedWorkspaceShellView: View {
                 defaultValue: "Couldn't connect to %@"
             ),
             connectFailedComputerName ?? ""
+        )
+    }
+
+    /// The reconnect attempt owns the store's latest classified failure. Show
+    /// it with its guidance, falling back only when no specific reason exists.
+    private var connectFailedMessage: String {
+        if let failure = MobileDisconnectedFailureCopy(
+            error: store?.connectionError,
+            guidance: store?.connectionErrorGuidance
+        ).combined {
+            return failure
+        }
+        return L10n.string(
+            "mobile.disconnected.connectFailedMessage",
+            defaultValue: "Make sure the computer is awake and online, then try again."
         )
     }
 
@@ -293,12 +300,16 @@ struct DisconnectedWorkspaceShellView: View {
     }
 
     private func confirmComputerRemoval() {
-        guard let deviceID = computerPendingRemovalID else {
+        guard let pairingID = computerPendingRemovalID,
+              let computer = savedComputers.first(where: { $0.id == pairingID }) else {
             return
         }
         computerPendingRemovalID = nil
         Task {
-            await store?.forgetMac(macDeviceID: deviceID)
+            await store?.forgetMac(
+                macDeviceID: computer.deviceId,
+                instanceTag: computer.instanceTag
+            )
             await store?.loadPairedMacs()
         }
     }
@@ -321,11 +332,6 @@ struct DisconnectedWorkspaceShellView: View {
                     : L10n.string("mobile.devices.savedDescription", defaultValue: "Tap a saved computer to reconnect, or add another.")
             )
         } actions: {
-            if hasKnownPairedMac, tailscaleStatusMonitor?.status == .inactiveOrNotInstalled {
-                TailscaleInactiveCallout(context: .disconnected)
-                    .frame(maxWidth: 320, alignment: .leading)
-                    .padding(.bottom, 4)
-            }
             if let store, !savedMacs.isEmpty {
                 VStack(spacing: 8) {
                     ForEach(savedMacs) { mac in

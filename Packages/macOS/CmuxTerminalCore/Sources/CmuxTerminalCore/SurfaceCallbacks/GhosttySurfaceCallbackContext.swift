@@ -1,42 +1,6 @@
 public import Foundation
 public import GhosttyKit
-internal import OSLog
-
-struct TerminalRendererProfilingStateSnapshot: Equatable, Sendable {
-    let visible: Bool
-    let focused: Bool
-}
-
-/// Lock-backed content-free renderer state shared by the UI and renderer
-/// threads. Reads wait for the tiny UI write critical section instead of
-/// dropping a structural renderer event from the trace.
-final class TerminalRendererProfilingStateStore: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: TerminalRendererProfilingStateSnapshot
-
-    init(visible: Bool = true, focused: Bool = false) {
-        self.value = TerminalRendererProfilingStateSnapshot(
-            visible: visible,
-            focused: focused
-        )
-    }
-
-    func update(visible: Bool, focused: Bool) {
-        lock.lock()
-        value = TerminalRendererProfilingStateSnapshot(
-            visible: visible,
-            focused: focused
-        )
-        lock.unlock()
-    }
-
-    @inline(__always)
-    func snapshot() -> TerminalRendererProfilingStateSnapshot {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
-    }
-}
+internal import CmuxFoundation
 
 /// The retained userdata handed to libghostty surface callbacks.
 ///
@@ -46,17 +10,13 @@ final class TerminalRendererProfilingStateStore: @unchecked Sendable {
 /// model and host view through the ``TerminalSurfaceControlling`` and
 /// ``TerminalSurfaceHosting`` seams.
 ///
-/// Isolation: this type is intentionally not `Sendable`. Both owner references
-/// are `weak`; renderer callbacks use only immutable identity plus the tiny
-/// profiling snapshot guarded below, without dereferencing either owner or
-/// hopping to the main actor. The owner releases the context only after the
-/// runtime surface has been freed.
+/// Isolation: this type is intentionally not `Sendable`. Both references are
+/// `weak`, identifiers and handlers are immutable, and the one cross-thread
+/// repair bit uses a lock-free atomic gate. Libghostty callbacks read only that
+/// state, then the handler hops to the main actor before touching the model or
+/// view. The owner releases the context only after the runtime surface has been
+/// freed.
 public final class GhosttySurfaceCallbackContext {
-    private let rendererState = TerminalRendererProfilingStateStore()
-    private let rendererEventSignposts = TerminalRendererProfilingSignposts()
-    nonisolated(unsafe) private var rendererEventPairing = TerminalRendererEventPairing()
-    nonisolated(unsafe) private var rendererUpdateState: OSSignpostIntervalState?
-    nonisolated(unsafe) private var rendererDrawState: OSSignpostIntervalState?
     /// The host view, used as a fallback identity source when the model
     /// reference has been released.
     public private(set) weak var surfaceHost: (any TerminalSurfaceHosting)?
@@ -67,28 +27,51 @@ public final class GhosttySurfaceCallbackContext {
     /// The stable identity of the surface this context was created for.
     public let surfaceId: UUID
 
-    /// Stable, opaque renderer trace identity captured before any runtime recreation.
-    public let rendererProfilingIdentity: TerminalRendererProfilingIdentity
+    /// Runs after renderer activity consumes an armed presentation repair.
+    private let rendererMailboxDidDrainHandler: @Sendable (UUID) -> Void
 
-    /// Whether the process requested renderer profiling through the existing environment gate.
-    public var rendererEventProfilingRequested: Bool { rendererEventSignposts.collectionRequested }
+    /// Lock-free so the unarmed renderer callback path neither allocates nor locks.
+    private let rendererPresentationRepairArmed = AtomicBooleanGate(false)
 
     /// Creates the callback userdata for one runtime surface.
     ///
     /// - Parameters:
     ///   - surfaceHost: The view hosting the surface.
     ///   - surfaceController: The surface model owning the runtime surface.
+    ///   - rendererMailboxDidDrain: Called with only the stable surface id after
+    ///     an armed repair observes renderer activity following a mailbox drain.
     public init(
         surfaceHost: any TerminalSurfaceHosting,
-        surfaceController: any TerminalSurfaceControlling
+        surfaceController: any TerminalSurfaceControlling,
+        rendererMailboxDidDrain: @escaping @Sendable (UUID) -> Void = { _ in }
     ) {
         self.surfaceHost = surfaceHost
         self.surfaceController = surfaceController
         self.surfaceId = surfaceController.surfaceId
-        self.rendererProfilingIdentity = TerminalRendererProfilingIdentity(
-            workspaceId: surfaceController.owningTabId,
-            surfaceId: surfaceController.surfaceId
-        )
+        self.rendererMailboxDidDrainHandler = rendererMailboxDidDrain
+    }
+
+    /// Arms one presentation repair for the next renderer mailbox-drain signal.
+    public func armRendererPresentationRepair() {
+        rendererPresentationRepairArmed.storeRelease(true)
+    }
+
+    /// Cancels an armed repair after the native renderer enqueue succeeds.
+    public func cancelRendererPresentationRepair() {
+        rendererPresentationRepairArmed.storeRelease(false)
+    }
+
+    /// Consumes at most one armed repair after the renderer drains its mailbox.
+    ///
+    /// - Returns: Whether this drain scheduled the armed repair.
+    @discardableResult
+    public func rendererMailboxDidDrain() -> Bool {
+        guard rendererPresentationRepairArmed.compareExchange(
+            expected: true,
+            desired: false
+        ) else { return false }
+        rendererMailboxDidDrainHandler(surfaceId)
+        return true
     }
 
     /// The owning workspace tab, read from the model first and the view as a
@@ -102,39 +85,5 @@ public final class GhosttySurfaceCallbackContext {
     public var runtimeSurface: ghostty_surface_t? {
         surfaceController?.runtimeSurfacePointer
             ?? surfaceHost?.attachedSurfaceController?.runtimeSurfacePointer
-    }
-
-    /// Publishes content-free UI state for the renderer callback.
-    public func updateRendererProfilingState(visible: Bool, focused: Bool) {
-        guard rendererEventSignposts.collectionRequested else { return }
-        rendererState.update(visible: visible, focused: focused)
-    }
-
-    /// Records an exact Ghostty renderer event synchronously on its calling renderer thread.
-    @inline(__always)
-    public func recordRendererEvent(_ event: ghostty_renderer_event_e) {
-        guard rendererEventSignposts.isEnabled,
-              let event = TerminalRendererProfilingEvent(event) else { return }
-        let state = rendererState.snapshot()
-
-        guard let action = rendererEventPairing.consume(event) else { return }
-        let metadata = TerminalRendererEventProfilingMetadata(
-            identity: rendererProfilingIdentity,
-            visible: state.visible,
-            focused: state.focused,
-            event: event
-        )
-        switch action {
-        case .begin(.updateFrame):
-            rendererUpdateState = rendererEventSignposts.beginRendererEvent(metadata)
-        case .end(.updateFrame):
-            rendererEventSignposts.endRendererEvent(rendererUpdateState, metadata)
-            rendererUpdateState = nil
-        case .begin(.drawFrame):
-            rendererDrawState = rendererEventSignposts.beginRendererEvent(metadata)
-        case .end(.drawFrame):
-            rendererEventSignposts.endRendererEvent(rendererDrawState, metadata)
-            rendererDrawState = nil
-        }
     }
 }
