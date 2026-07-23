@@ -399,6 +399,31 @@ We want to hear it. Open an [issue](https://github.com/manaflow-ai/cmux/issues) 
  </picture>
 </a>
 
+## Fork development
+
+This is a personal fork (`allenlinsh/cmux`). Local **Release** builds must use
+`scripts/reload-fork.sh` — **not** `scripts/reloadp.sh`. `reloadp.sh` builds under
+`com.cmuxterm.*`, which is registered to Manaflow's Apple team, so it fails to
+sign in a fork.
+
+`reload-fork.sh` reads a gitignored `.fork-config` at the repo root:
+
+```sh
+FORK_BUNDLE_ID=dev.you.cmux.staging   # your own namespace (never com.cmuxterm.*)
+FORK_TEAM_ID=XXXXXXXXXX               # your Apple team ID (optional; omit for ad-hoc, unsigned)
+FORK_APP_NAME="cmux fork"             # display name
+```
+
+Build and install to `~/Applications/"$FORK_APP_NAME.app"`:
+
+```sh
+CMUX_SKIP_ZIG_BUILD=1 ./scripts/reload-fork.sh --install
+```
+
+Drop `--install` to build without copying. `CMUX_SKIP_ZIG_BUILD=1` is required
+wherever zig 0.15.2 can't link against the host SDK. Debug builds still use
+`scripts/reload.sh --tag <name>` as usual.
+
 ## Contributing
 
 Ways to get involved:
