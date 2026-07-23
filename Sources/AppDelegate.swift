@@ -796,6 +796,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var shortcutLayoutCharacterProvider: (UInt16, NSEvent.ModifierFlags) -> String? = KeyboardLayout.character(forKeyCode:modifierFlags:)
     private var workspaceObserver: NSObjectProtocol?
     private var lifecycleSnapshotObservers: [NSObjectProtocol] = []
+    private var remoteSessionNetworkPathMonitor: RemoteSessionNetworkPathMonitor?
+    private let remoteSessionNetworkPathQueue = DispatchQueue(
+        label: "com.cmux.remote-session-network-path",
+        qos: .utility
+    )
     private var windowKeyObservers: [NSObjectProtocol] = []
     private var shortcutMonitor: Any?
     private var shortcutDefaultsObserver: NSObjectProtocol?
@@ -3802,6 +3807,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         )
         lifecycleSnapshotObservers.append(contentsOf: remotePowerObservers)
+
+        let networkPathMonitor = RemoteSessionNetworkPathMonitor(
+            onNetworkPathRestored: { [weak self] in
+                self?.rearmRemoteSessionsAfterNetworkPathChange()
+            }
+        )
+        networkPathMonitor.start(queue: remoteSessionNetworkPathQueue)
+        remoteSessionNetworkPathMonitor = networkPathMonitor
 
         registerDisplayReconfigurationCallbackIfNeeded()
         let displayReconfigurationObserver = NotificationCenter.default.addObserver(

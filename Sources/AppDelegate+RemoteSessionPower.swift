@@ -13,6 +13,12 @@ extension AppDelegate {
         }
     }
 
+    func rearmRemoteSessionsAfterNetworkPathChange() {
+        forEachRemoteWorkspace { workspace in
+            workspace.rearmRemoteSessionAfterNetworkPathChange()
+        }
+    }
+
     private func forEachRemoteWorkspace(_ body: (Workspace) -> Void) {
         var seenManagers = Set<ObjectIdentifier>()
         let managers = [tabManager].compactMap { $0 } + allMainWindowTabManagersForDebug()

@@ -11,6 +11,12 @@ extension Workspace {
         )
     }
 
+    func rearmRemoteSessionAfterNetworkPathChange() {
+        remotePTYSessionControllerForSocketCommand()?.resetReconnectPolicyAndReconnect(
+            reason: "network path changed"
+        )
+    }
+
     func markPersistentRemotePTYAttachFailed(surfaceId: UUID) {
         guard remoteConfiguration?.preserveAfterTerminalExit == true else { return }
         let previousPresentedDirectory = presentedCurrentDirectory
