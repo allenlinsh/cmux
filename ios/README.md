@@ -19,6 +19,21 @@ Build and reload the simulator:
 ios/scripts/reload.sh --tag iossh
 ```
 
+### Personal fork → physical iPhone
+
+If you are not on Manaflow's Apple team, do **not** use TestFlight/App Store
+lanes or Manaflow bundle ids. Use the fork companion (reads repo-root
+`.fork-config`, same as `scripts/reload-fork.sh`):
+
+```bash
+# .fork-config needs FORK_BUNDLE_ID + FORK_TEAM_ID (and optional FORK_IOS_*)
+ios/scripts/reload-fork.sh
+```
+
+That installs a Release build under your own bundle id
+(`${FORK_BUNDLE_ID}.ios` by default) and is meant to pair with the Mac app from
+`scripts/reload-fork.sh --install`. Details: README "Fork development".
+
 Run package tests:
 
 ```bash

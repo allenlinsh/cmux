@@ -406,13 +406,19 @@ This is a personal fork (`allenlinsh/cmux`). Local **Release** builds must use
 `com.cmuxterm.*`, which is registered to Manaflow's Apple team, so it fails to
 sign in a fork.
 
-`reload-fork.sh` reads a gitignored `.fork-config` at the repo root:
+`reload-fork.sh` (and the iOS companion) read a gitignored `.fork-config` at the
+repo root:
 
 ```sh
 FORK_BUNDLE_ID=dev.you.cmux.staging   # your own namespace (never com.cmuxterm.*)
-FORK_TEAM_ID=XXXXXXXXXX               # your Apple team ID (optional; omit for ad-hoc, unsigned)
+FORK_TEAM_ID=XXXXXXXXXX               # your Apple team ID (optional on Mac for ad-hoc; required for iOS device)
 FORK_APP_NAME="cmux fork"             # display name
+# optional iOS overrides:
+# FORK_IOS_BUNDLE_ID=dev.you.cmux.staging.ios   # default: ${FORK_BUNDLE_ID}.ios
+# FORK_IOS_APP_NAME="cmux fork"                 # default: $FORK_APP_NAME
 ```
+
+### Mac
 
 Build and install to `~/Applications/"$FORK_APP_NAME.app"`:
 
@@ -424,6 +430,26 @@ Drop `--install` to build without copying. `CMUX_SKIP_ZIG_BUILD=1` is required
 wherever zig 0.15.2 can't link against the host SDK. Debug builds still use
 `scripts/reload.sh --tag <name>` as usual.
 
+### iOS (physical device)
+
+Same `.fork-config`, then:
+
+```sh
+ios/scripts/reload-fork.sh
+```
+
+That builds a **Release** iOS app under `FORK_IOS_BUNDLE_ID` (default
+`${FORK_BUNDLE_ID}.ios`), signs with `FORK_TEAM_ID`, installs on a connected
+iPhone, and launches it. Fork entitlements strip Manaflow-only capabilities
+(Sign in with Apple / push) so a personal team can automatic-sign; email Stack
+sign-in and pairing still work.
+
+This path is meant to pair with the Mac fork Release app (instance tag
+`default`). Do **not** mix it with `ios/scripts/reload.sh --tag …` (DEV tag
+channel) against a `reload-fork` Mac — those channels are incompatible.
+
+Useful flags: `--no-install`, `--no-launch`, `--simulator`, `--device-id <id>`,
+`--allow-device-registration`.
 ## Contributing
 
 Ways to get involved:

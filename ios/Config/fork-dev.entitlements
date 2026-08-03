@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Fork device builds strip Manaflow-only capabilities (Sign in with Apple,
+	     APNs, time-sensitive push) so a personal/free team can automatic-sign.
+	     Email Stack sign-in and local pairing still work. -->
+</dict>
+</plist>
