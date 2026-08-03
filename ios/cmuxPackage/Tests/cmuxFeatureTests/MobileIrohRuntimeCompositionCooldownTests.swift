@@ -13,44 +13,49 @@ import Testing
 @MainActor
 @Suite("Mobile Iroh runtime composition broker cooldown", .serialized)
 struct MobileIrohRuntimeCompositionCooldownTests {
-    /// Re-drives the lifecycle until the broker fake has seen activity (or the
-    /// runtime activated). Auth observation and reconcile coalesce across
-    /// main-actor tasks, so a single prepareForConnection can settle before
-    /// the first activation lands; short bounded sleeps (max ~5s) let every
-    /// executor drain between attempts.
+    /// The production readiness owner is the event-driven barrier. Tests inject
+    /// deterministic jitter and await that same barrier instead of polling the
+    /// main actor with wall-clock sleeps.
     private func settleActivation(
         _ fixture: MobileIrohCooldownFixture,
-        until condition: @escaping () async -> Bool
+        expecting condition: @escaping () async -> Bool
     ) async {
-        for _ in 0 ..< 500 {
-            if await condition() { return }
-            try? await Task.sleep(nanoseconds: 10_000_000)
-            await fixture.composition.prepareForConnection()
+        await fixture.composition.prepareForConnection()
+        if !(await condition()) {
+            Issue.record("Connection readiness settled before the activation outcome")
         }
     }
 
     @Test
-    func rateLimitFloorsActivationAndSurfacesRetryAfter() async throws {
+    func discoveryRateLimitFloorsOnlyDiscoveryAndSurfacesRetryAfter() async throws {
         let fixture = try await MobileIrohCooldownFixture.make(
-            registrationError: CmxIrohTrustBrokerClientError.rateLimited(
+            registrationError: nil,
+            discoveryError: CmxIrohTrustBrokerClientError.rateLimited(
                 code: nil,
                 retryAfterSeconds: 600
             )
         )
 
         await settleActivation(fixture) {
-            await fixture.broker.totalRequestCount() >= 1
+            guard await fixture.broker.discoveryRequestCount() >= 1 else {
+                return false
+            }
+            return (await fixture.diagnosticLog.snapshot()).events.contains {
+                $0.code == .endpointFailed
+            }
         }
-        let flooredRequestCount = await fixture.broker.totalRequestCount()
-        #expect(flooredRequestCount >= 1)
+        let discoveryCountAtFloor = await fixture.broker.discoveryRequestCount()
+        #expect(discoveryCountAtFloor == 1)
         #expect((await fixture.diagnosticLog.snapshot()).events.contains {
             $0.code == .endpointFailed
         })
 
-        // Within the Retry-After floor every further attempt must be free.
+        // Registration and discovery are separate broker operations. Re-driving
+        // activation may refresh registration, but the floored discovery route
+        // must remain free until the broker's Retry-After deadline expires.
         await fixture.composition.prepareForConnection()
         await fixture.composition.prepareForConnection()
-        #expect(await fixture.broker.totalRequestCount() == flooredRequestCount)
+        #expect(await fixture.broker.discoveryRequestCount() == discoveryCountAtFloor)
 
         let dialError: any Error
         do {
@@ -60,47 +65,18 @@ struct MobileIrohRuntimeCompositionCooldownTests {
         } catch {
             dialError = error
         }
-        #expect(await fixture.broker.totalRequestCount() == flooredRequestCount)
+        #expect(await fixture.broker.discoveryRequestCount() == discoveryCountAtFloor)
         #expect((dialError as? any CmxRetryAfterProviding)?.retryAfterSeconds ?? 0 > 0)
 
-        fixture.clock.advance(by: 601)
+        fixture.clock.advance(by: 751)
         await settleActivation(fixture) {
-            await fixture.broker.totalRequestCount() > flooredRequestCount
+            await fixture.broker.discoveryRequestCount() > discoveryCountAtFloor
         }
-        #expect(await fixture.broker.totalRequestCount() == flooredRequestCount + 1)
+        #expect(await fixture.broker.discoveryRequestCount() == discoveryCountAtFloor + 1)
     }
 
     @Test
-    func cooldownGateDoesNotExtendItsOwnDeadline() async throws {
-        let fixture = try await MobileIrohCooldownFixture.make(
-            registrationError: CmxIrohTrustBrokerClientError.rateLimited(
-                code: nil,
-                retryAfterSeconds: 600
-            )
-        )
-        await settleActivation(fixture) {
-            await fixture.broker.totalRequestCount() >= 1
-        }
-        let flooredRequestCount = await fixture.broker.totalRequestCount()
-
-        // Hammering the gate late in the window throws its synthesized
-        // cooldown error each time; those echoes must not push the deadline
-        // forward or the floor would never expire under retry pressure.
-        fixture.clock.advance(by: 590)
-        for _ in 0 ..< 5 {
-            await fixture.composition.prepareForConnection()
-        }
-        #expect(await fixture.broker.totalRequestCount() == flooredRequestCount)
-
-        fixture.clock.advance(by: 11)
-        await settleActivation(fixture) {
-            await fixture.broker.totalRequestCount() > flooredRequestCount
-        }
-        #expect(await fixture.broker.totalRequestCount() == flooredRequestCount + 1)
-    }
-
-    @Test
-    func nonRateLimitedFailureKeepsInactiveDialBehavior() async throws {
+    func nonRateLimitedFailureBacksOffAcrossConnectionEntryPoints() async throws {
         let fixture = try await MobileIrohCooldownFixture.make(
             registrationError: MobileIrohCooldownTestError.unavailable
         )
@@ -108,6 +84,9 @@ struct MobileIrohRuntimeCompositionCooldownTests {
         await settleActivation(fixture) {
             await fixture.broker.totalRequestCount() >= 1
         }
+        // Drain any still-running reconcile before counting, so the settled
+        // baseline is stable against task-scheduling noise.
+        await fixture.composition.prepareForConnection()
         let settledRequestCount = await fixture.broker.totalRequestCount()
 
         let transportError: any Error
@@ -118,8 +97,7 @@ struct MobileIrohRuntimeCompositionCooldownTests {
         } catch {
             transportError = error
         }
-        #expect(transportError as? CmxIrohClientRuntimeError == .inactive)
-        #expect((transportError as? any CmxRetryAfterProviding)?.retryAfterSeconds == nil)
+        #expect((transportError as? any CmxRetryAfterProviding)?.retryAfterSeconds ?? 0 > 0)
 
         let laneError: any Error
         do {
@@ -138,8 +116,7 @@ struct MobileIrohRuntimeCompositionCooldownTests {
         } catch {
             laneError = error
         }
-        #expect(laneError as? CmxIrohClientRuntimeError == .inactive)
-        #expect((laneError as? any CmxRetryAfterProviding)?.retryAfterSeconds == nil)
+        #expect((laneError as? any CmxRetryAfterProviding)?.retryAfterSeconds ?? 0 > 0)
 
         let eventStreamError: any Error
         do {
@@ -149,20 +126,159 @@ struct MobileIrohRuntimeCompositionCooldownTests {
         } catch {
             eventStreamError = error
         }
-        #expect(eventStreamError as? CmxIrohClientRuntimeError == .inactive)
-        #expect((eventStreamError as? any CmxRetryAfterProviding)?.retryAfterSeconds == nil)
-        // No cooldown for non-rate-limited failures: each dial retried a
-        // fresh activation and reached the broker again.
-        #expect(await fixture.broker.totalRequestCount() > settledRequestCount)
+        #expect((eventStreamError as? any CmxRetryAfterProviding)?.retryAfterSeconds ?? 0 > 0)
+        #expect(
+            await fixture.broker.totalRequestCount() == settledRequestCount,
+            "transport, lane, and event-stream callers must share one activation backoff"
+        )
+    }
+
+    @Test
+    func clientBackoffBoundsFailingActivationRetries() async throws {
+        let fixture = try await MobileIrohCooldownFixture.make(
+            registrationError: MobileIrohCooldownTestError.unavailable
+        )
+        await settleActivation(fixture) {
+            await fixture.broker.totalRequestCount() >= 1
+        }
+        await fixture.composition.prepareForConnection()
+        let settled = await fixture.broker.totalRequestCount()
+
+        // The injected clock is frozen inside the armed backoff window, so
+        // every re-driven preparation and dial must stay broker-silent. Before
+        // the client backoff existed, each of these re-ran registration.
+        for _ in 0 ..< 20 {
+            await fixture.composition.prepareForConnection()
+        }
+        _ = try? await fixture.composition.transport(for: fixture.request)
+        _ = try? await fixture.composition.transport(for: fixture.request)
+        #expect(await fixture.broker.totalRequestCount() == settled)
+
+        // The armed nap is observable and bounded by the foreground cap: no
+        // multi-minute sleep can be scheduled while the app is active.
+        let scheduled = (await fixture.diagnosticLog.snapshot()).events.filter {
+            $0.code == .retryScheduled
+        }
+        #expect(!scheduled.isEmpty)
+        #expect(scheduled.allSatisfy { ($0.ms ?? .max) <= 30_000 })
+
+        // Past the foreground cap, exactly one further attempt runs; its
+        // failure re-arms the window and later drives stay broker-silent.
+        fixture.clock.advance(by: 31)
+        await settleActivation(fixture) {
+            await fixture.broker.totalRequestCount() > settled
+        }
+        #expect(await fixture.broker.totalRequestCount() == settled + 1)
+        for _ in 0 ..< 5 {
+            await fixture.composition.prepareForConnection()
+        }
+        #expect(await fixture.broker.totalRequestCount() == settled + 1)
+    }
+
+    @Test
+    func networkPathChangeResetsActivationBackoff() async throws {
+        let fixture = try await MobileIrohCooldownFixture.make(
+            registrationError: MobileIrohCooldownTestError.unavailable
+        )
+        await settleActivation(fixture) {
+            await fixture.broker.totalRequestCount() >= 1
+        }
+        await fixture.composition.prepareForConnection()
+        let settled = await fixture.broker.totalRequestCount()
+        await fixture.composition.prepareForConnection()
+        #expect(await fixture.broker.totalRequestCount() == settled)
+
+        // A network-path-change signal clears the armed window: the failure
+        // streak belonged to the previous path.
+        var invoked = await fixture.networkPathChangeHook.invoke()
+        for _ in 0 ..< 200 where !invoked {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            invoked = await fixture.networkPathChangeHook.invoke()
+        }
+        #expect(invoked)
+        await settleActivation(fixture) {
+            await fixture.broker.totalRequestCount() > settled
+        }
+        #expect(await fixture.broker.totalRequestCount() == settled + 1)
+    }
+
+    @Test
+    func failingActivationFollowsExactSeededSchedule() async throws {
+        let seed: UInt64 = 0xB0FF
+        let fixture = try await MobileIrohCooldownFixture.make(
+            registrationError: MobileIrohCooldownTestError.unavailable,
+            activationBackoff: CmxIrohReconnectBackoff(seed: seed),
+            diagnosticCapacity: 4_096
+        )
+        await settleActivation(fixture) {
+            await fixture.broker.totalRequestCount() >= 1
+        }
+        await fixture.composition.prepareForConnection()
+        #expect(await fixture.broker.totalRequestCount() == 1)
+
+        // A twin ladder with the same seed predicts the exact schedule: the
+        // first attempt at t=0, each retry at the first whole second on or
+        // after the previous attempt time plus its drawn delay.
+        let horizon = 600.0
+        let twin = CmxIrohReconnectBackoff(seed: seed)
+        var expectedDelays: [TimeInterval] = []
+        var expectedAttemptCount = 1
+        var attemptAt = 0.0
+        while true {
+            let delay = twin.nextDelay()
+            expectedDelays.append(delay)
+            let nextAttemptAt = (attemptAt + delay).rounded(.up)
+            guard nextAttemptAt <= horizon else { break }
+            attemptAt = nextAttemptAt
+            expectedAttemptCount += 1
+        }
+
+        // Simulate ten foreground minutes, redriving the ladder every second.
+        for _ in 0 ..< Int(horizon) {
+            fixture.clock.advance(by: 1)
+            await fixture.composition.prepareForConnection()
+        }
+        #expect(await fixture.broker.totalRequestCount() == expectedAttemptCount)
+
+        // Every scheduled nap matches the twin's draw, and none exceeds the
+        // foreground cap.
+        let scheduledMS = (await fixture.diagnosticLog.snapshot()).events
+            .filter { $0.code == .retryScheduled }
+            .compactMap(\.ms)
+        let expectedMS = expectedDelays.prefix(expectedAttemptCount).map {
+            UInt32(clamping: Int($0 * 1_000))
+        }
+        #expect(scheduledMS == Array(expectedMS))
+        #expect(scheduledMS.allSatisfy { $0 <= 30_000 })
+    }
+
+    @Test
+    func scenePhaseActiveResetsActivationBackoff() async throws {
+        let fixture = try await MobileIrohCooldownFixture.make(
+            registrationError: MobileIrohCooldownTestError.unavailable
+        )
+        await settleActivation(fixture) {
+            await fixture.broker.totalRequestCount() >= 1
+        }
+        await fixture.composition.prepareForConnection()
+        let settled = await fixture.broker.totalRequestCount()
+        await fixture.composition.prepareForConnection()
+        #expect(await fixture.broker.totalRequestCount() == settled)
+
+        // Returning to the foreground clears the armed window without any
+        // clock advance: the very next preparation retries immediately.
+        fixture.composition.didBecomeActive()
+        await settleActivation(fixture) {
+            await fixture.broker.totalRequestCount() > settled
+        }
+        #expect(await fixture.broker.totalRequestCount() == settled + 1)
     }
 
     @Test
     func freshRelayBootstrapCredentialAvoidsSecondMint() async throws {
         let fixture = try await MobileIrohCooldownFixture.makeSuccessfulBootstrap()
 
-        await settleActivation(fixture) {
-            fixture.composition.runtime != nil
-        }
+        await fixture.broker.waitForBootstrapRequest()
 
         #expect(fixture.composition.runtime != nil)
         #expect(await fixture.broker.bootstrapRequestCount() >= 1)
@@ -170,7 +286,22 @@ struct MobileIrohRuntimeCompositionCooldownTests {
     }
 
     @Test
-    func activeRuntimeRateLimitFloorsPolicyRefreshAndDiscovery() async throws {
+    func suspendedRelayRefreshCannotBlockDirectPathActivation() async throws {
+        let fixture = try await MobileIrohCooldownFixture.makeSuccessfulBootstrap(
+            suspendRelayBootstrap: true
+        )
+
+        await fixture.broker.waitForBootstrapRequest()
+
+        #expect(fixture.composition.runtime != nil)
+        #expect((await fixture.diagnosticLog.snapshot()).events.contains {
+            $0.code == .endpointActive
+        })
+        await fixture.broker.resumeRelayBootstrap()
+    }
+
+    @Test
+    func activeRuntimeRateLimitFloorsRelayRefreshWithoutBlockingDiscovery() async throws {
         let fixture = try await MobileIrohCooldownFixture.makeSuccessfulBootstrap()
         await settleActivation(fixture) {
             fixture.composition.runtime != nil
@@ -187,17 +318,17 @@ struct MobileIrohRuntimeCompositionCooldownTests {
         #expect(requestCountAtFloor == requestCountBeforeRateLimit + 1)
         #expect(bootstrapCountAtFloor == bootstrapCountBeforeRateLimit + 1)
 
-        // This is the field loop: settings refresh and discovery can both
-        // re-enter the broker while the already-active runtime reconnects.
-        // The first 429 owns the whole account-scoped request floor.
+        // Relay refreshes share one operation floor. Authenticated discovery is
+        // a separate server budget and must remain usable while that floor is active.
         await fixture.composition.refreshIrohSettings()
         await fixture.composition.prepareForConnection()
         _ = await fixture.composition.discoverLiveMacs()
         _ = await fixture.composition.discoverLiveMacs()
         await fixture.composition.refreshIrohSettings()
 
-        #expect(await fixture.broker.totalRequestCount() == requestCountAtFloor)
         #expect(await fixture.broker.bootstrapRequestCount() == bootstrapCountAtFloor)
+        #expect(await fixture.broker.totalRequestCount() > requestCountAtFloor)
+        #expect(await fixture.broker.discoveryRequestCount() > 1)
     }
 
     @Test
@@ -211,29 +342,22 @@ struct MobileIrohRuntimeCompositionCooldownTests {
         await fixture.broker.setRelayBootstrapRateLimit(retryAfterSeconds: 600)
         await fixture.composition.refreshIrohSettings()
         let requestCountAtFloor = await fixture.broker.totalRequestCount()
-        let diagnosticCountAtFloor = (await fixture.diagnosticLog.snapshot()).events.count
+        let bootstrapCountAtFloor = await fixture.broker.bootstrapRequestCount()
 
         // Rebuild the process-owned composition over the same injected
-        // UserDefaults domain and repositories. A persisted floor must be
-        // restored before the replacement can perform any broker work.
+        // UserDefaults domain and repositories. A new gate instance must restore
+        // the relay-operation floor while registration and discovery remain usable.
         let recreated = fixture.recreatingComposition()
         await settleActivation(recreated) {
-            if recreated.composition.runtime != nil { return true }
-            if await recreated.broker.totalRequestCount() > requestCountAtFloor { return true }
-            let events = (await recreated.diagnosticLog.snapshot()).events
-            return events.dropFirst(diagnosticCountAtFloor).contains {
-                $0.code == .endpointFailed
-            }
+            recreated.composition.runtime != nil
         }
 
-        #expect(await recreated.broker.totalRequestCount() == requestCountAtFloor)
-        do {
-            _ = try await recreated.composition.transport(for: recreated.request)
-            Issue.record("Expected the recreated composition to restore the broker cooldown")
-        } catch {
-            #expect((error as? any CmxRetryAfterProviding)?.retryAfterSeconds ?? 0 > 0)
-        }
-        #expect(await recreated.broker.totalRequestCount() == requestCountAtFloor)
+        #expect(recreated.composition.runtime != nil)
+        #expect(await recreated.broker.totalRequestCount() > requestCountAtFloor)
+        #expect(await recreated.broker.bootstrapRequestCount() == bootstrapCountAtFloor)
+
+        await recreated.composition.refreshIrohSettings()
+        #expect(await recreated.broker.bootstrapRequestCount() == bootstrapCountAtFloor)
     }
 }
 
@@ -282,25 +406,45 @@ private struct MobileIrohCooldownFixture {
     /// coordinator); the fixture must retain it or every reconcile silently
     /// no-ops against a deallocated coordinator.
     let auth: AuthCoordinator
+    /// Captures the reachability-change hook the composition registers, so a
+    /// test can simulate one network-path-change signal.
+    let networkPathChangeHook: MobileIrohCooldownHookBox
     private let compositionFactory: @MainActor () -> MobileIrohRuntimeComposition
 
     static func make(
-        registrationError: any Error
+        registrationError: (any Error)?,
+        discoveryError: (any Error)? = nil,
+        activationBackoff: CmxIrohReconnectBackoff? = nil,
+        diagnosticCapacity: Int = 64
     ) async throws -> Self {
-        try await make(registrationError: registrationError, relayPolicy: nil)
+        try await make(
+            registrationError: registrationError,
+            discoveryError: discoveryError,
+            relayPolicy: nil,
+            activationBackoff: activationBackoff,
+            diagnosticCapacity: diagnosticCapacity
+        )
     }
 
-    static func makeSuccessfulBootstrap() async throws -> Self {
+    static func makeSuccessfulBootstrap(
+        suspendRelayBootstrap: Bool = false
+    ) async throws -> Self {
         let policy = MobileIrohCooldownRelayPolicyFixture(now: now)
         return try await make(
             registrationError: nil,
-            relayPolicy: policy
+            discoveryError: nil,
+            relayPolicy: policy,
+            suspendRelayBootstrap: suspendRelayBootstrap
         )
     }
 
     private static func make(
         registrationError: (any Error)?,
-        relayPolicy: MobileIrohCooldownRelayPolicyFixture?
+        discoveryError: (any Error)?,
+        relayPolicy: MobileIrohCooldownRelayPolicyFixture?,
+        suspendRelayBootstrap: Bool = false,
+        activationBackoff: CmxIrohReconnectBackoff? = nil,
+        diagnosticCapacity: Int = 64
     ) async throws -> Self {
         let suiteName = "MobileIrohRuntimeCompositionCooldownTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
@@ -343,14 +487,20 @@ private struct MobileIrohCooldownFixture {
         )
         let broker = MobileIrohCooldownBroker(
             registrationError: registrationError,
+            discoveryError: discoveryError,
             registration: registration,
             discovery: discovery,
-            bootstrap: try relayPolicy?.bootstrap()
+            bootstrap: try relayPolicy?.bootstrap(),
+            suspendRelayBootstrap: suspendRelayBootstrap
         )
         let credentialStore = MobileIrohCooldownCredentialStore()
         let clock = MobileIrohCooldownTestClock(now)
-        let diagnosticLog = DiagnosticLog(capacity: 64, role: .mobileClient)
+        let diagnosticLog = DiagnosticLog(
+            capacity: diagnosticCapacity,
+            role: .mobileClient
+        )
         let stableDeviceID = deviceID
+        let networkPathChangeHook = MobileIrohCooldownHookBox()
         let brokerCredentials = CmxIrohBrokerCredentialRepository(
             secureStore: credentialStore,
             installState: installState
@@ -385,9 +535,17 @@ private struct MobileIrohCooldownFixture {
                 relayPolicyTrustRoot: relayPolicyTrustRoot,
                 endpointFactory: endpointFactory,
                 brokerFactory: { _ in broker },
+                brokerBackpressureGate: CmxIrohBrokerBackpressureGate(
+                    store: CmxIrohUserDefaultsInstallStateStore(defaults: defaults),
+                    now: { clock.now() }
+                ),
                 deviceID: { stableDeviceID },
                 tag: tag,
                 now: { clock.now() },
+                startNetworkPathObservation: { onPathChange in
+                    await networkPathChangeHook.set(onPathChange)
+                },
+                activationRetryBackoff: activationBackoff,
                 diagnosticLog: diagnosticLog,
                 debugDefaults: defaults
             )
@@ -441,6 +599,7 @@ private struct MobileIrohCooldownFixture {
             request: try request(),
             diagnosticLog: diagnosticLog,
             auth: auth,
+            networkPathChangeHook: networkPathChangeHook,
             compositionFactory: compositionFactory
         )
     }
@@ -455,6 +614,7 @@ private struct MobileIrohCooldownFixture {
             request: request,
             diagnosticLog: diagnosticLog,
             auth: auth,
+            networkPathChangeHook: networkPathChangeHook,
             compositionFactory: compositionFactory
         )
     }
@@ -548,6 +708,22 @@ private struct MobileIrohCooldownFixture {
     }
 }
 
+/// Captures the composition's reachability-change callback for tests.
+actor MobileIrohCooldownHookBox {
+    private var hook: (@Sendable () async -> Void)?
+
+    func set(_ hook: @escaping @Sendable () async -> Void) {
+        self.hook = hook
+    }
+
+    /// Runs the captured hook once, returning whether it was registered yet.
+    func invoke() async -> Bool {
+        guard let hook else { return false }
+        await hook()
+        return true
+    }
+}
+
 private struct MobileIrohCooldownRelayPolicyFixture {
     let privateKey = Curve25519.Signing.PrivateKey()
     let now: Date
@@ -635,24 +811,33 @@ private actor MobileIrohCooldownBroker:
     CmxIrohRelayPolicyServing
 {
     private let registrationError: (any Error)?
+    private let discoveryError: (any Error)?
     private let registration: CmxIrohRegistrationResponse
     private let discoveryResponse: CmxIrohDiscoveryResponse
     private let bootstrap: CmxIrohRelayBootstrapResponse?
     private var relayBootstrapRetryAfterSeconds: Int?
     private var totalRequests = 0
+    private var discoveryRequests = 0
     private var bootstrapRequests = 0
     private var relayTokenRequests = 0
+    private var suspendRelayBootstrap: Bool
+    private var relayBootstrapContinuation: CheckedContinuation<Void, Never>?
+    private var bootstrapRequestWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(
         registrationError: (any Error)?,
+        discoveryError: (any Error)?,
         registration: CmxIrohRegistrationResponse,
         discovery: CmxIrohDiscoveryResponse,
-        bootstrap: CmxIrohRelayBootstrapResponse?
+        bootstrap: CmxIrohRelayBootstrapResponse?,
+        suspendRelayBootstrap: Bool
     ) {
         self.registrationError = registrationError
+        self.discoveryError = discoveryError
         self.registration = registration
         discoveryResponse = discovery
         self.bootstrap = bootstrap
+        self.suspendRelayBootstrap = suspendRelayBootstrap
     }
 
     func setRelayBootstrapRateLimit(retryAfterSeconds: Int) {
@@ -668,8 +853,10 @@ private actor MobileIrohCooldownBroker:
         return registration
     }
 
-    func discover() -> CmxIrohDiscoveryResponse {
+    func discover() throws -> CmxIrohDiscoveryResponse {
         totalRequests += 1
+        discoveryRequests += 1
+        if let discoveryError { throw discoveryError }
         return discoveryResponse
     }
 
@@ -699,9 +886,17 @@ private actor MobileIrohCooldownBroker:
 
     func issueRelayBootstrap(
         endpointID _: CmxIrohPeerIdentity
-    ) throws -> CmxIrohRelayBootstrapResponse {
+    ) async throws -> CmxIrohRelayBootstrapResponse {
         totalRequests += 1
         bootstrapRequests += 1
+        let waiters = bootstrapRequestWaiters
+        bootstrapRequestWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        if suspendRelayBootstrap {
+            await withCheckedContinuation { continuation in
+                relayBootstrapContinuation = continuation
+            }
+        }
         if let relayBootstrapRetryAfterSeconds {
             throw CmxIrohTrustBrokerClientError.rateLimited(
                 code: nil,
@@ -710,6 +905,12 @@ private actor MobileIrohCooldownBroker:
         }
         guard let bootstrap else { throw MobileIrohCooldownTestError.unavailable }
         return bootstrap
+    }
+
+    func resumeRelayBootstrap() {
+        suspendRelayBootstrap = false
+        relayBootstrapContinuation?.resume()
+        relayBootstrapContinuation = nil
     }
 
     func relayPreference() throws -> CmxIrohRelayPreferenceResponse {
@@ -725,8 +926,16 @@ private actor MobileIrohCooldownBroker:
     }
 
     func totalRequestCount() -> Int { totalRequests }
+    func discoveryRequestCount() -> Int { discoveryRequests }
     func bootstrapRequestCount() -> Int { bootstrapRequests }
     func relayTokenRequestCount() -> Int { relayTokenRequests }
+
+    func waitForBootstrapRequest() async {
+        guard bootstrapRequests == 0 else { return }
+        await withCheckedContinuation { continuation in
+            bootstrapRequestWaiters.append(continuation)
+        }
+    }
 }
 
 private actor MobileIrohCooldownEndpointFactory: CmxIrohEndpointFactory {

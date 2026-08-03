@@ -13,6 +13,12 @@ public struct MobileSyncWorkspaceListResponse: Decodable, Sendable {
         public let windowID: String?
         /// User-facing workspace title.
         public let title: String
+        /// Custom workspace description, when reported by the Mac.
+        public let customDescription: String?
+        /// Whether `customDescription` is a bounded projection of a longer Mac value.
+        public let customDescriptionIsTruncated: Bool?
+        /// Custom workspace accent color as `#RRGGBB`, when reported by the Mac.
+        public let customColorHex: String?
         /// The workspace's current working directory, if reported.
         public let currentDirectory: String?
         /// Whether the Mac currently has this workspace selected.
@@ -46,6 +52,9 @@ public struct MobileSyncWorkspaceListResponse: Decodable, Sendable {
             case id
             case windowID = "window_id"
             case title
+            case customDescription = "description"
+            case customDescriptionIsTruncated = "description_truncated"
+            case customColorHex = "custom_color"
             case currentDirectory = "current_directory"
             case isSelected = "is_selected"
             case isPinned = "is_pinned"
@@ -64,6 +73,9 @@ public struct MobileSyncWorkspaceListResponse: Decodable, Sendable {
             id: String,
             windowID: String?,
             title: String,
+            customDescription: String? = nil,
+            customDescriptionIsTruncated: Bool? = nil,
+            customColorHex: String? = nil,
             currentDirectory: String?,
             isSelected: Bool,
             isPinned: Bool?,
@@ -77,6 +89,9 @@ public struct MobileSyncWorkspaceListResponse: Decodable, Sendable {
             self.id = id
             self.windowID = windowID
             self.title = title
+            self.customDescription = customDescription
+            self.customDescriptionIsTruncated = customDescriptionIsTruncated
+            self.customColorHex = customColorHex
             self.currentDirectory = currentDirectory
             self.isSelected = isSelected
             self.isPinned = isPinned
@@ -90,7 +105,7 @@ public struct MobileSyncWorkspaceListResponse: Decodable, Sendable {
     }
 
     /// A workspace group section in the list response. Mirrors the iOS-facing
-    /// subset the Mac emits (no v2 handle refs, color, or icon). Members are
+    /// subset the Mac emits (no v2 handle refs or color). Members are
     /// listed in the Mac's spatial (`tabs`) order. Absent on Macs old enough not
     /// to emit groups.
     public struct Group: Decodable, Sendable {
@@ -102,6 +117,8 @@ public struct MobileSyncWorkspaceListResponse: Decodable, Sendable {
         public let isCollapsed: Bool
         /// Whether the group is pinned on the Mac.
         public let isPinned: Bool
+        /// SF Symbol rendered by the corresponding group row on the Mac.
+        public let iconSymbol: String?
         /// The anchor workspace that owns this group. It is represented by the
         /// group header and never rendered as a separate row.
         public let anchorWorkspaceID: String
@@ -115,6 +132,7 @@ public struct MobileSyncWorkspaceListResponse: Decodable, Sendable {
             case name
             case isCollapsed = "is_collapsed"
             case isPinned = "is_pinned"
+            case iconSymbol = "icon_symbol"
             case anchorWorkspaceID = "anchor_workspace_id"
         }
 
@@ -124,12 +142,14 @@ public struct MobileSyncWorkspaceListResponse: Decodable, Sendable {
             name: String,
             isCollapsed: Bool,
             isPinned: Bool,
+            iconSymbol: String? = nil,
             anchorWorkspaceID: String
         ) {
             self.id = id
             self.name = name
             self.isCollapsed = isCollapsed
             self.isPinned = isPinned
+            self.iconSymbol = iconSymbol
             self.anchorWorkspaceID = anchorWorkspaceID
         }
     }
@@ -228,6 +248,3 @@ extension MobileSyncWorkspaceListResponse {
         self.createdTerminalID = createdTerminalID
     }
 }
-
-
-
