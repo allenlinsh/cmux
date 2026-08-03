@@ -177,6 +177,8 @@ fi
 
 CONFIGURATION="Release"
 PRODUCTS_DIR="Release-iphoneos"
+# Prefer a concrete device destination so automatic signing can register the
+# UDID (generic/platform=iOS often produces a profile that won't install).
 DESTINATION="generic/platform=iOS"
 if [[ "$TARGET" == "simulator" ]]; then
   PRODUCTS_DIR="Release-iphonesimulator"
@@ -185,6 +187,8 @@ if [[ "$TARGET" == "simulator" ]]; then
   else
     DESTINATION="platform=iOS Simulator,name=$SIMULATOR_NAME"
   fi
+elif [[ -n "$DEVICE_ID" ]]; then
+  DESTINATION="platform=iOS,id=$DEVICE_ID"
 fi
 
 BUILD_ARGS=(
@@ -354,8 +358,8 @@ for device in data.get("result", {}).get("devices", []):
     if not destination_id or not install_id:
         continue
     name = properties.get("name") or destination_id
-    tunnel = str(connection.get("tunnelState") || "")
-    boot = str(properties.get("bootState") || "")
+    tunnel = str(connection.get("tunnelState") or "")
+    boot = str(properties.get("bootState") or "")
     available = tunnel.lower() in ("connected", "ready") or boot.lower() == "booted"
     devices.append({
         "identifier": destination_id,
