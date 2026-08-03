@@ -1,5 +1,4 @@
 import AppKit
-import CmuxChromium
 import CmuxSettings
 import CmuxSimulatorUI
 import WebKit
@@ -322,44 +321,11 @@ extension AppDelegate {
     /// (issue #6776).
     func shortcutEventFirstResponderOwnsBrowserWebView(_ event: NSEvent) -> Bool {
         let shortcutWindow = shortcutResolvedEventWindow(event) ?? NSApp.keyWindow ?? NSApp.mainWindow
-        guard let responder = shortcutWindow?.firstResponder else {
+        guard let responder = shortcutWindow?.firstResponder,
+              let webView = shortcutOwningWebView(for: responder) else {
             return false
         }
-        if let webView = shortcutOwningWebView(for: responder) {
-            return shortcutBrowserPanel(webView: webView) != nil
-        }
-        if let chromiumView = shortcutOwningChromiumWebView(for: responder) {
-            return shortcutBrowserPanel(chromiumWebView: chromiumView) != nil
-        }
-        return false
-    }
-
-    private func shortcutOwningChromiumWebView(for responder: NSResponder?) -> ChromiumWebView? {
-        var current: NSResponder? = responder
-        var hops = 0
-        while let candidate = current, hops < 64 {
-            if let view = candidate as? ChromiumWebView {
-                return view
-            }
-            current = candidate.nextResponder
-            hops += 1
-        }
-        return nil
-    }
-
-    private func shortcutBrowserPanel(chromiumWebView view: ChromiumWebView) -> BrowserPanel? {
-        for manager in shortcutCandidateTabManagers() {
-            for workspace in manager.tabs {
-                for panel in workspace.panels.values {
-                    guard let browserPanel = panel as? BrowserPanel,
-                          browserPanel.chromium?.webView === view else {
-                        continue
-                    }
-                    return browserPanel
-                }
-            }
-        }
-        return nil
+        return shortcutBrowserPanel(webView: webView) != nil
     }
 
     private func shortcutFocusedBrowserPanel(in window: NSWindow?) -> BrowserPanel? {

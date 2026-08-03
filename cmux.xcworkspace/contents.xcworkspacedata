@@ -121,9 +121,6 @@
          location = "group:CmuxCanvasUI">
       </FileRef>
       <FileRef
-         location = "group:CmuxChromium">
-      </FileRef>
-      <FileRef
          location = "group:CmuxCommandPalette">
       </FileRef>
       <FileRef

@@ -752,15 +752,6 @@ struct cmuxApp: App {
                     }
                 }
 
-                Button(
-                    String(
-                        localized: "menu.file.newChromiumBrowserWindow",
-                        defaultValue: "New Chromium Browser Window (Experimental)"
-                    )
-                ) {
-                    ChromiumBrowserDebugWindowController.shared.show()
-                }
-
                 if CmuxFeatureFlags.shared.isSimulatorEnabled {
                     Button(String(localized: "menu.file.newSimulatorPane", defaultValue: "New Simulator Pane")) {
                         performNewSimulatorPaneFromMenu()

@@ -630,7 +630,6 @@ extension Workspace {
                 transparentBackground: browserPanel.sessionSnapshotTransparentBackground,
                 diffViewerToken: diffViewerComponents?.token,
                 diffViewerRequestPath: diffViewerComponents?.requestPath,
-                engineKind: browserPanel.engineKind.rawValue
             )
             markdownSnapshot = nil
             filePreviewSnapshot = nil
@@ -1760,9 +1759,7 @@ extension Workspace {
                 focus: false,
                 preferredProfileID: snapshot.browser?.profileID,
                 creationPolicy: .restoration,
-                transparentBackground: snapshot.browser?.transparentBackground ?? false,
-                restoredEngineKind: snapshot.browser?.engineKind
-                    .flatMap { BrowserSurfaceEngineKind(rawValue: $0) } ?? .webkit
+                transparentBackground: snapshot.browser?.transparentBackground ?? false
             ) else {
                 return nil
             }
@@ -3269,7 +3266,6 @@ final class Workspace: Identifiable, ObservableObject {
                 initialURL: initialBrowserURL,
                 omnibarVisible: initialBrowserOmnibarVisible,
                 transparentBackground: initialBrowserTransparentBackground,
-                engineKind: BrowserEngineSettings.resolveEngineKindForNewSurface(workspaceId: id)
             )
             configureBrowserPanel(browserPanel)
             panels[browserPanel.id] = browserPanel
@@ -8461,7 +8457,6 @@ final class Workspace: Identifiable, ObservableObject {
             bypassRemoteProxy: bypassRemoteProxy,
             isRemoteWorkspace: isRemoteWorkspace,
             remoteWebsiteDataStoreIdentifier: isRemoteWorkspace && !bypassRemoteProxy ? id : nil,
-            engineKind: BrowserEngineSettings.resolveEngineKindForNewSurface(workspaceId: id),
             websiteDataStore: websiteDataStore
         )
         configureBrowserPanel(browserPanel)
@@ -8537,7 +8532,6 @@ final class Workspace: Identifiable, ObservableObject {
         omnibarVisible: Bool = true,
         transparentBackground: Bool = false,
         bypassRemoteProxy: Bool = false,
-        restoredEngineKind: BrowserSurfaceEngineKind? = nil,
         websiteDataStore: WKWebsiteDataStore? = nil
     ) -> BrowserPanel? {
         // A remote tmux mirror workspace is a 1:1 view of a tmux session (which
@@ -8562,13 +8556,6 @@ final class Workspace: Identifiable, ObservableObject {
         let previousFocusedPanelId = focusedPanelId
         let previousHostedView = focusedTerminalInputTarget()?.panel.hostedView
 
-        let engineKind: BrowserSurfaceEngineKind
-        if let restoredEngineKind {
-            engineKind = BrowserEngineSettings.restoredEngineKind(restoredEngineKind, workspaceId: id)
-        } else {
-            engineKind = BrowserEngineSettings.resolveEngineKindForNewSurface(workspaceId: id)
-        }
-
         let browserPanel = BrowserPanel(
             workspaceId: id,
             profileID: resolvedNewBrowserProfileID(
@@ -8586,7 +8573,6 @@ final class Workspace: Identifiable, ObservableObject {
             bypassRemoteProxy: bypassRemoteProxy,
             isRemoteWorkspace: isRemoteWorkspace,
             remoteWebsiteDataStoreIdentifier: isRemoteWorkspace && !bypassRemoteProxy ? id : nil,
-            engineKind: engineKind,
             websiteDataStore: websiteDataStore
         )
         configureBrowserPanel(browserPanel)

@@ -1693,10 +1693,7 @@ struct BrowserPanelView: View {
         let useLocalInlineDeveloperToolsHosting = canvasInlineBrowserHosting
 
         return Group {
-            // Chromium hosts its own process view directly in the container, so it
-            // mounts regardless of the WebKit-oriented `shouldRenderWebView` gate;
-            // the container stays empty for the sub-second session startup.
-            if panel.shouldRenderWebView || panel.engineKind == .chromium {
+            if panel.shouldRenderWebView {
                 WebViewRepresentable(
                     panel: panel,
                     paneId: paneId,
@@ -5366,9 +5363,6 @@ struct WebViewRepresentable: NSViewRepresentable {
         private var hasPendingGeometryNotification = false
         private weak var hostedWebView: WKWebView?
         private var hostedWebViewConstraints: [NSLayoutConstraint] = []
-        private weak var hostedChromiumView: NSView?
-        private var chromiumDisconnectedBanner: NSTextField?
-        private var chromiumDisconnectedBannerConstraints: [NSLayoutConstraint] = []
         private weak var localInlineSlotView: WindowBrowserSlotView?
         private var localInlineSlotConstraints: [NSLayoutConstraint] = []
         private weak var hostedInspectorSideDockContainerView: HostedInspectorSideDockContainerView?
@@ -5733,68 +5727,6 @@ struct WebViewRepresentable: NSViewRepresentable {
         func clearLocalInlineCallbacks() {
             onPreferredHostedInspectorWidthChanged = nil
             localInlineSlotView?.onHostedInspectorLayout = nil
-        }
-
-        /// Mounts the Chromium engine's `NSView` directly in this container,
-        /// bypassing the WKWebView portal registry. `chromiumView` is a single
-        /// shared view owned by `BrowserPanelChromiumState`; a pane move rebuilds
-        /// the container and re-parents it here.
-        func mountChromiumContent(_ chromiumView: NSView?, showDisconnectedBanner: Bool, bannerText: String) {
-            if let chromiumView, chromiumView.superview !== self {
-                for subview in subviews where subview !== chromiumDisconnectedBanner {
-                    subview.removeFromSuperview()
-                }
-                chromiumView.removeFromSuperview()
-                chromiumView.frame = bounds
-                chromiumView.autoresizingMask = [.width, .height]
-                addSubview(chromiumView, positioned: .below, relativeTo: chromiumDisconnectedBanner)
-                hostedChromiumView = chromiumView
-            }
-            updateChromiumDisconnectedBanner(visible: showDisconnectedBanner, text: bannerText)
-        }
-
-        private func updateChromiumDisconnectedBanner(visible: Bool, text: String) {
-            guard visible else {
-                NSLayoutConstraint.deactivate(chromiumDisconnectedBannerConstraints)
-                chromiumDisconnectedBannerConstraints = []
-                chromiumDisconnectedBanner?.removeFromSuperview()
-                chromiumDisconnectedBanner = nil
-                return
-            }
-            let banner = chromiumDisconnectedBanner ?? makeChromiumDisconnectedBanner()
-            banner.stringValue = text
-            chromiumDisconnectedBanner = banner
-            if banner.superview !== self {
-                banner.removeFromSuperview()
-                addSubview(banner, positioned: .above, relativeTo: nil)
-                NSLayoutConstraint.deactivate(chromiumDisconnectedBannerConstraints)
-                chromiumDisconnectedBannerConstraints = [
-                    banner.topAnchor.constraint(equalTo: topAnchor),
-                    banner.leadingAnchor.constraint(equalTo: leadingAnchor),
-                    banner.trailingAnchor.constraint(equalTo: trailingAnchor),
-                ]
-                NSLayoutConstraint.activate(chromiumDisconnectedBannerConstraints)
-            }
-        }
-
-        private func makeChromiumDisconnectedBanner() -> NSTextField {
-            let banner = NSTextField(labelWithString: "")
-            banner.translatesAutoresizingMaskIntoConstraints = false
-            banner.alignment = .center
-            banner.lineBreakMode = .byTruncatingTail
-            banner.textColor = .white
-            banner.wantsLayer = true
-            banner.layer?.backgroundColor = NSColor.systemRed.withAlphaComponent(0.9).cgColor
-            banner.drawsBackground = false
-            banner.isBezeled = false
-            banner.isEditable = false
-            banner.isSelectable = false
-            banner.font = .systemFont(ofSize: 12, weight: .medium)
-            banner.cell?.usesSingleLineMode = false
-            banner.maximumNumberOfLines = 2
-            banner.setContentHuggingPriority(.defaultHigh, for: .vertical)
-            banner.setContentCompressionResistancePriority(.defaultHigh, for: .vertical)
-            return banner
         }
 
         private func appendHostedWebKitSubviews(
@@ -7706,10 +7638,6 @@ struct WebViewRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        if panel.engineKind == .chromium {
-            updateUsingChromium(nsView, context: context)
-            return
-        }
         let webView = panel.webView
         let coordinator = context.coordinator
         let isCurrentPaneOwner = currentPaneDropContext()?.paneId.id == paneId.id
@@ -7741,44 +7669,6 @@ struct WebViewRepresentable: NSViewRepresentable {
             shouldFocusWebView: shouldFocusWebView && isCurrentPaneOwner && hostOwnsPortal,
             isPanelFocused: isPanelFocused && isCurrentPaneOwner && hostOwnsPortal
         )
-    }
-
-    /// Mount path for `.chromium` panels. Activation is async: `chromium` is
-    /// `@Published`, so `BrowserPanelView` re-renders and re-runs this once the
-    /// session's `ChromiumWebView` exists, mounting it into the host container.
-    private func updateUsingChromium(_ nsView: NSView, context: Context) {
-        guard let container = nsView as? HostContainerView else { return }
-        context.coordinator.panel = panel
-        panel.activateChromiumIfNeeded()
-        container.mountChromiumContent(
-            panel.chromium?.webView,
-            showDisconnectedBanner: panel.chromiumDisconnected,
-            bannerText: panel.chromiumDisconnectedBannerText
-        )
-        // Route keyboard focus to the freshly-mounted Chromium surface, matching the
-        // WebKit content-focus gate (shouldFocusWebView && current pane owner &&
-        // attached) and honoring the same suppression flags. Never steals focus for
-        // a background or non-selected tab.
-        //
-        // Blank surfaces are the omnibar's: `autoFocusOmnibarIfBlank` focuses the
-        // address bar on a fresh (about:blank) surface, but it runs from onAppear
-        // while this runs on the representable update, so without this guard the
-        // content view races it and wins, leaving the address bar unfocused on a
-        // newly opened browser. WebKit avoids this because omnibar autofocus flips
-        // `shouldFocusWebView` off first; mirror that by skipping content focus while
-        // the surface is still blank.
-        let isCurrentPaneOwner = currentPaneDropContext()?.paneId.id == paneId.id
-        if shouldFocusWebView,
-           isPanelFocused,
-           isCurrentPaneOwner,
-           shouldAttachWebView,
-           !panel.shouldSuppressWebViewFocus(),
-           panel.preferredURLStringForOmnibar() != nil,
-           let chromiumView = panel.chromium?.webView,
-           let window = chromiumView.window,
-           !Self.responderChainContains(window.firstResponder, target: chromiumView) {
-            window.makeFirstResponder(chromiumView)
-        }
     }
 
     private static func applyFocus(

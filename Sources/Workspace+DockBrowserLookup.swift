@@ -117,7 +117,6 @@ extension DockSplitStore {
             bypassRemoteProxy: settings.bypassRemoteProxy,
             isRemoteWorkspace: settings.isRemoteWorkspace,
             remoteWebsiteDataStoreIdentifier: settings.remoteWebsiteDataStoreIdentifier,
-            engineKind: BrowserEngineSettings.resolveEngineKindForNewSurface(workspaceId: workspaceId),
             websiteDataStore: websiteDataStore
         )
         panel.setRemoteWorkspaceStatus(settings.remoteStatus)

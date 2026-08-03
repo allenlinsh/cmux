@@ -101,16 +101,6 @@ Default: `cloudFirst`.
 
 `sectionOrder` is accepted as an alias. Project-local `.cmux/cmux.json` values override the global setting.
 
-## `browser.engine`
-
-Engine for newly created cmux browser surfaces. Existing surfaces keep the engine they were created with.
-
-Values: `webkit`, `chromium`.
-
-Default: `webkit`.
-
-`chromium` is experimental; it requires an installed OWL Chromium runtime, see [`docs/chromium-runtime.md`](./chromium-runtime.md).
-
 ## `terminal.agentHibernation`
 
 Routine Agent Hibernation is opt-in. cmux kills idle background agent processes to free RAM and CPU, then resumes each one with its saved session when you visit its tab. Independently, critical memory pressure can trigger a bounded safety pass over eligible idle background agents even when routine hibernation is disabled. See [agent-hooks.md](agent-hooks.md#agent-hibernation) for the full eligibility rules, confirmation settle window, and resume behavior.

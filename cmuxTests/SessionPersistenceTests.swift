@@ -471,6 +471,7 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(object["height"]), 704.5, accuracy: 0.001)
     }
 
+
     func testSessionBrowserPanelSnapshotHistoryRoundTrip() throws {
         let profileID = try XCTUnwrap(UUID(uuidString: "8F03A658-5A84-428B-AD03-5A6D04692F64"))
         let source = SessionBrowserPanelSnapshot(
@@ -487,8 +488,7 @@ final class SessionPersistenceTests: XCTestCase {
             ],
             forwardHistoryURLStrings: [
                 "https://example.com/d"
-            ],
-            engineKind: BrowserSurfaceEngineKind.chromium.rawValue
+            ]
         )
 
         let data = try JSONEncoder().encode(source)
@@ -499,39 +499,6 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertEqual(decoded.omnibarVisible, false)
         XCTAssertEqual(decoded.backHistoryURLStrings, source.backHistoryURLStrings)
         XCTAssertEqual(decoded.forwardHistoryURLStrings, source.forwardHistoryURLStrings)
-        XCTAssertEqual(decoded.engineKind, "chromium")
-        XCTAssertEqual(BrowserSurfaceEngineKind(rawValue: decoded.engineKind ?? ""), .chromium)
-
-        let webkitSource = SessionBrowserPanelSnapshot(
-            urlString: source.urlString,
-            profileID: source.profileID,
-            shouldRenderWebView: source.shouldRenderWebView,
-            pageZoom: source.pageZoom,
-            developerToolsVisible: source.developerToolsVisible,
-            isMuted: source.isMuted,
-            omnibarVisible: source.omnibarVisible,
-            backHistoryURLStrings: source.backHistoryURLStrings,
-            forwardHistoryURLStrings: source.forwardHistoryURLStrings,
-            engineKind: BrowserSurfaceEngineKind.webkit.rawValue
-        )
-        let webkitData = try JSONEncoder().encode(webkitSource)
-        let webkitDecoded = try JSONDecoder().decode(SessionBrowserPanelSnapshot.self, from: webkitData)
-        XCTAssertEqual(webkitDecoded.engineKind, "webkit")
-        XCTAssertEqual(BrowserSurfaceEngineKind(rawValue: webkitDecoded.engineKind ?? ""), .webkit)
-    }
-
-    func testBrowserPanelEngineKindResolution() {
-        let webkit = BrowserPanel.resolveEngineKind(configured: .webkit, runtimeAvailable: true)
-        XCTAssertEqual(webkit.kind, .webkit)
-        XCTAssertFalse(webkit.didFallBack)
-
-        let chromiumAvailable = BrowserPanel.resolveEngineKind(configured: .chromium, runtimeAvailable: true)
-        XCTAssertEqual(chromiumAvailable.kind, .chromium)
-        XCTAssertFalse(chromiumAvailable.didFallBack)
-
-        let chromiumUnavailable = BrowserPanel.resolveEngineKind(configured: .chromium, runtimeAvailable: false)
-        XCTAssertEqual(chromiumUnavailable.kind, .webkit)
-        XCTAssertTrue(chromiumUnavailable.didFallBack)
     }
 
     func testSessionBrowserPanelSnapshotHistoryDecodesWhenKeysAreMissing() throws {
@@ -551,7 +518,6 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertNil(decoded.omnibarVisible)
         XCTAssertNil(decoded.backHistoryURLStrings)
         XCTAssertNil(decoded.forwardHistoryURLStrings)
-        XCTAssertNil(decoded.engineKind)
     }
 
     func testScrollbackReplayEnvironmentWritesReplayFile() {

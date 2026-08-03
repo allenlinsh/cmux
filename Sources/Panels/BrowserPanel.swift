@@ -2,7 +2,6 @@ import Foundation
 import CMUXMobileCore
 import CmuxCore
 import CmuxBrowser
-import CmuxChromium
 import CmuxFoundation
 import CmuxSettings
 import Combine
@@ -616,55 +615,6 @@ enum BrowserAvailabilitySettings {
         // `set` already persists; `synchronize()` is a deprecated no-op-style fsync.
         defaults.set(disabled, forKey: disabledKey)
         NotificationCenter.default.post(name: didChangeNotification, object: nil)
-    }
-}
-
-enum BrowserEngineSettings {
-    static let engineKey = "browserEngineOverride"
-
-    static func configuredEngine(defaults: UserDefaults = .standard) -> BrowserEngineChoice {
-        guard let raw = defaults.string(forKey: engineKey),
-              let choice = BrowserEngineChoice(rawValue: raw) else {
-            return .webkit
-        }
-        return choice
-    }
-}
-
-/// Engine backing a browser surface. Resolved at surface creation from the
-/// configured `BrowserEngineChoice` and runtime availability, then persisted.
-enum BrowserSurfaceEngineKind: String, Codable, Sendable {
-    case webkit
-    case chromium
-}
-
-extension BrowserEngineSettings {
-    /// Engine kind for a newly created (non-restored) surface, posting the
-    /// once-per-run fallback notification when a Chromium request degrades to WebKit.
-    @MainActor
-    static func resolveEngineKindForNewSurface(workspaceId: UUID) -> BrowserSurfaceEngineKind {
-        let configured = configuredEngine()
-        let runtimeAvailable = configured == .chromium ? ChromiumRuntimeManager.shared.isRuntimeAvailable() : false
-        let resolution = BrowserPanel.resolveEngineKind(
-            configured: configured,
-            runtimeAvailable: runtimeAvailable
-        )
-        if resolution.didFallBack {
-            ChromiumRuntimeManager.shared.postFallbackNotificationIfNeeded(workspaceId: workspaceId)
-        }
-        return resolution.kind
-    }
-
-    /// Engine kind for a restored surface: preserve the persisted kind unless a
-    /// persisted Chromium surface can no longer find a runtime, then fall back.
-    @MainActor
-    static func restoredEngineKind(_ persisted: BrowserSurfaceEngineKind, workspaceId: UUID) -> BrowserSurfaceEngineKind {
-        guard persisted == .chromium else { return .webkit }
-        if ChromiumRuntimeManager.shared.isRuntimeAvailable() {
-            return .chromium
-        }
-        ChromiumRuntimeManager.shared.postFallbackNotificationIfNeeded(workspaceId: workspaceId)
-        return .webkit
     }
 }
 
@@ -2775,70 +2725,6 @@ final class BrowserPanel: Panel, ObservableObject {
     @Published private(set) var profileID: UUID
     @Published private(set) var historyStore: BrowserHistoryStore
 
-    /// Engine backing this surface, resolved at creation and persisted with the session.
-    /// `@Published` so a runtime-start failure can flip `.chromium → .webkit` and
-    /// re-render `BrowserPanelView` onto the WebKit render path.
-    @Published private(set) var engineKind: BrowserSurfaceEngineKind = .webkit
-
-    /// Live Chromium engine state; non-nil once the surface acquires a session.
-    /// Stays non-nil (with `chromiumDisconnected == true`) after a process crash
-    /// so the omnibar can offer Reload to restart it.
-    @Published private(set) var chromium: BrowserPanelChromiumState?
-
-    /// Guards against a redundant async `acquireSession` while one is already
-    /// in flight (`chromium` is only assigned post-await).
-    private var chromiumActivationInProgress = false
-
-    /// True when a mount requested Chromium activation but the surface is a
-    /// remote-workspace pane whose loopback proxy endpoint has not arrived yet.
-    /// The Content Shell can only adopt a proxy at launch, so activation waits;
-    /// `setRemoteProxyEndpoint` re-invokes it when the endpoint lands.
-    private var chromiumActivationWaitingForRemoteProxy = false
-
-    /// The `--proxy-server` value the live Chromium session was launched with,
-    /// used to detect endpoint changes that require a session restart.
-    private var chromiumLaunchedProxyServer: String?
-
-    /// True after the Chromium browser process ended; reload restarts a fresh session.
-    @Published private(set) var chromiumDisconnected: Bool = false
-
-    /// Test-only stand-in for the chromium engine's content view so focus
-    /// behavior is exercisable without a live Content Shell session.
-    /// Reached via `@testable import`; only tests assign it.
-    var chromiumWebContentViewOverrideForTesting: NSView?
-
-    /// Test seam: when set, `activateChromiumIfNeeded` reports the initial URL
-    /// and `--proxy-server` value it would launch the Content Shell with, then
-    /// returns without acquiring a real session.
-    /// Reached via `@testable import`; only tests assign it.
-    var chromiumActivationInterceptorForTesting: ((_ initialURL: String, _ proxyServer: String?) -> Void)?
-
-    /// Tracks whether the Chromium runtime's DevTools panel is currently open, so
-    /// the shared Toggle Developer Tools action can drive open/close on `.chromium`.
-    private var chromiumDevToolsVisible: Bool = false
-
-    /// Initial (or last-requested) URL for a `.chromium` surface whose session is
-    /// not yet up. `activateChromiumIfNeeded` consumes it; navigation requests
-    /// arriving before activation overwrite it.
-    private var pendingInitialChromiumURL: String?
-
-    /// Last URL mirrored from the Chromium model, used to restore after a crash reload.
-    private var lastMirroredChromiumURL: String?
-
-    /// Pure resolution of the configured engine against runtime availability.
-    /// `.chromium` degrades to `.webkit` (with `didFallBack == true`) when no runtime is present.
-    nonisolated static func resolveEngineKind(
-        configured: BrowserEngineChoice,
-        runtimeAvailable: Bool
-    ) -> (kind: BrowserSurfaceEngineKind, didFallBack: Bool) {
-        switch configured {
-        case .webkit:
-            return (.webkit, false)
-        case .chromium:
-            return runtimeAvailable ? (.chromium, false) : (.webkit, true)
-        }
-    }
-
     /// The underlying web view
     private(set) var webView: WKWebView
     let viewportHostView = BrowserViewportHostView(frame: .zero)
@@ -4222,7 +4108,6 @@ final class BrowserPanel: Panel, ObservableObject {
         bypassRemoteProxy: Bool = false,
         isRemoteWorkspace: Bool = false,
         remoteWebsiteDataStoreIdentifier: UUID? = nil,
-        engineKind: BrowserSurfaceEngineKind = .webkit,
         websiteDataStore explicitWebsiteDataStore: WKWebsiteDataStore? = nil
     ) {
         // Register fallback defaults and normalize legacy/out-of-range settings once
@@ -4231,7 +4116,6 @@ final class BrowserPanel: Panel, ObservableObject {
         self.id = UUID()
         self.mobileBrowserDialogBroker = MobileBrowserDialogBroker(panelID: self.id.uuidString)
         self.workspaceId = workspaceId
-        self.engineKind = engineKind
         let resolvedProfileID = Self.resolvedProfileID(requested: profileID)
         self.profileID = resolvedProfileID
         self.insecureHTTPBypassHostOnce = BrowserInsecureHTTPSettings.normalizeHost(bypassInsecureHTTPHostOnce ?? "")
@@ -4502,11 +4386,6 @@ final class BrowserPanel: Panel, ObservableObject {
             currentURL = initialRequest.url
             shouldRenderWebView = renderInitialNavigation
             guard renderInitialNavigation else { return }
-            if engineKind == .chromium {
-                pendingInitialChromiumURL = initialRequest.url?.absoluteString
-                lastMirroredChromiumURL = initialRequest.url?.absoluteString
-                return
-            }
             if let url = initialRequest.url,
                insecureHTTPBypassHostOnce == nil,
                shouldBlockInsecureHTTPNavigation(to: url) {
@@ -4526,11 +4405,6 @@ final class BrowserPanel: Panel, ObservableObject {
             currentURL = url
             shouldRenderWebView = renderInitialNavigation
             guard renderInitialNavigation else { return }
-            if engineKind == .chromium {
-                pendingInitialChromiumURL = url.absoluteString
-                lastMirroredChromiumURL = url.absoluteString
-                return
-            }
             if adoptedPrewarmedWebView {
                 // Already navigated while hidden; record for recovery paths.
                 navigationDelegate?.recordAttemptedRequest(URLRequest(url: url), displayURL: url)
@@ -4740,7 +4614,6 @@ final class BrowserPanel: Panel, ObservableObject {
         remoteProxyEndpoint = endpoint
         applyProxyConfigurationIfAvailable()
         resumePendingRemoteNavigationIfNeeded()
-        syncChromiumSessionProxyIfNeeded()
     }
 
     func setRemoteWorkspaceStatus(_ status: BrowserRemoteWorkspaceStatus?) {
@@ -4938,7 +4811,6 @@ final class BrowserPanel: Panel, ObservableObject {
         }
         applyProxyConfigurationIfAvailable()
         resumePendingRemoteNavigationIfNeeded()
-        syncChromiumSessionProxyIfNeeded()
     }
 
     @discardableResult
@@ -5638,23 +5510,8 @@ final class BrowserPanel: Panel, ObservableObject {
 
     // MARK: - Panel Protocol
 
-    /// Whether `responder` sits in the responder chain of this panel's live
-    /// web content — the Chromium engine view when active, else the WKWebView.
-    func responderOwnsEngineWebContent(_ responder: NSResponder?) -> Bool {
-        if let chromiumView = chromium?.webView,
-           Self.responderChainContains(responder, target: chromiumView) {
-            return true
-        }
-        return Self.responderChainContains(responder, target: webView)
-    }
-
     func focus() {
         if shouldSuppressWebViewFocus() {
-            return
-        }
-
-        if engineKind == .chromium {
-            focusChromiumWebView()
             return
         }
 
@@ -5684,21 +5541,6 @@ final class BrowserPanel: Panel, ObservableObject {
         endSuppressWebViewFocusForAddressBar()
         clearWebViewFocusSuppression()
         NotificationCenter.default.post(name: .browserDidBlurAddressBar, object: id)
-
-        if engineKind == .chromium {
-            guard let chromiumView = chromium?.webView,
-                  let window = chromiumView.window,
-                  !chromiumView.isHiddenOrHasHiddenAncestor else { return false }
-            if Self.responderChainContains(window.firstResponder, target: chromiumView) {
-                suppressOmnibarAutofocus(for: 1.5)
-                noteWebViewFocused()
-                return true
-            }
-            guard window.makeFirstResponder(chromiumView) else { return false }
-            suppressOmnibarAutofocus(for: 1.5)
-            noteWebViewFocused()
-            return true
-        }
 
         guard let window = webView.window, !webView.isHiddenOrHasHiddenAncestor else { return false }
 
@@ -5730,11 +5572,11 @@ final class BrowserPanel: Panel, ObservableObject {
     func unfocus() {
         clearBrowserFocusMode(reason: "panelUnfocus")
         invalidateSearchFocusRequests(reason: "panelUnfocus")
-        guard let window = webView.window ?? chromium?.webView.window else { return }
+        guard let window = webView.window else { return }
         if BrowserWindowPortalRegistry.yieldSearchOverlayFocusIfOwned(by: id, in: window) {
             return
         }
-        if responderOwnsEngineWebContent(window.firstResponder) {
+        if Self.responderChainContains(window.firstResponder, target: webView) {
             window.makeFirstResponder(nil)
         }
     }
@@ -5773,8 +5615,6 @@ final class BrowserPanel: Panel, ObservableObject {
         openAppLinkInBrowserSplit = nil
         detachWebViewObservers()
         faviconTask?.cancel(); faviconTask = nil
-        chromium?.teardown()
-        chromium = nil
     }
 
     // MARK: - Popup window management
@@ -6140,317 +5980,6 @@ final class BrowserPanel: Panel, ObservableObject {
 
     // MARK: - Navigation
 
-    // MARK: - Chromium engine
-
-    /// Localized banner shown when the Chromium process has ended.
-    var chromiumDisconnectedBannerText: String {
-        String(
-            localized: "chromium.disconnected",
-            defaultValue: "Chromium browser process ended — Reload to restart it"
-        )
-    }
-
-    /// Acquires a Chromium session for this surface and begins mirroring its
-    /// state into the omnibar-feeding properties. Idempotent; a no-op on
-    /// `.webkit` surfaces or once a session already exists.
-    func activateChromiumIfNeeded() {
-        // `chromium` is only assigned after the async `acquireSession` completes,
-        // so the `chromium == nil` guard alone lets a second `updateNSView` in the
-        // same window spawn a redundant Content Shell. This synchronous flag closes
-        // that window.
-        guard engineKind == .chromium, chromium == nil, !chromiumActivationInProgress else { return }
-        // The Content Shell adopts `--proxy-server` at launch only, so a
-        // remote-workspace pane must wait for its loopback proxy endpoint
-        // (WebKit parity: `pendingRemoteNavigation` queues until the endpoint
-        // arrives). `setRemoteProxyEndpoint` re-invokes activation.
-        if usesRemoteWorkspaceProxy, remoteProxyEndpoint == nil {
-            chromiumActivationWaitingForRemoteProxy = true
-            return
-        }
-        chromiumActivationWaitingForRemoteProxy = false
-        chromiumActivationInProgress = true
-        let proxyServer = chromiumRemoteProxyServer
-        let rawInitialURL = pendingInitialChromiumURL ?? blankURLString
-        let initialURL = chromiumOutboundURLString(rawInitialURL)
-        let requestedProfileID = profileID
-        if let interceptor = chromiumActivationInterceptorForTesting {
-            chromiumActivationInProgress = false
-            interceptor(initialURL, proxyServer)
-            return
-        }
-        Task { @MainActor in
-            do {
-                let (session, model, webView) = try await ChromiumRuntimeManager.shared.acquireSession(
-                    initialURL: initialURL,
-                    profileID: requestedProfileID,
-                    proxyServer: proxyServer
-                )
-                self.chromiumActivationInProgress = false
-                guard self.engineKind == .chromium, self.chromium == nil else {
-                    session.close()
-                    return
-                }
-                self.chromiumLaunchedProxyServer = proxyServer
-                let state = BrowserPanelChromiumState(session: session, model: model, webView: webView)
-                self.chromium = state
-                self.startChromiumMirroring(state)
-                if let pendingURL = self.pendingInitialChromiumURL, pendingURL != rawInitialURL {
-                    self.pendingInitialChromiumURL = nil
-                    let outboundURL = self.chromiumOutboundURLString(pendingURL)
-                    Task { try? await session.navigate(to: outboundURL) }
-                }
-            } catch {
-#if DEBUG
-                cmuxDebugLog("browser.chromium.activate.failed panel=\(self.id.uuidString.prefix(5)) error=\(error)")
-#endif
-                self.chromiumActivationInProgress = false
-                // Runtime failed after creation-time availability check: degrade to
-                // WebKit. The dormant WKWebView was never navigated (chromium init
-                // early-returns before navigate), so drive it to the pending URL now;
-                // flipping @Published engineKind re-renders onto the WebKit path.
-                self.engineKind = .webkit
-                let fallbackURLString = self.pendingInitialChromiumURL
-                    ?? self.currentURL?.absoluteString
-                    ?? self.blankURLString
-                self.pendingInitialChromiumURL = nil
-                if let fallbackURL = URL(string: fallbackURLString) {
-                    self.navigate(to: fallbackURL)
-                }
-                ChromiumRuntimeManager.shared.postFallbackNotificationIfNeeded(workspaceId: self.workspaceId)
-            }
-        }
-    }
-
-    /// `--proxy-server` value for a Chromium launch on this surface: the
-    /// remote-workspace loopback broker as a SOCKS5 proxy, or `nil` for local
-    /// panes. SOCKS5 makes Chromium send hostnames to the proxy unresolved, so
-    /// the loopback alias host reaches the broker without a DNS round trip
-    /// (WebKit parity: `applyProxyConfigurationIfAvailable` prefers SOCKS too).
-    private var chromiumRemoteProxyServer: String? {
-        guard usesRemoteWorkspaceProxy, let endpoint = remoteProxyEndpoint else { return nil }
-        let host = endpoint.host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !host.isEmpty, endpoint.port > 0, endpoint.port <= 65535 else { return nil }
-        return "socks5://\(host):\(endpoint.port)"
-    }
-
-    /// URL string the Chromium session should actually load. Remote panes
-    /// rewrite loopback hosts to the proxy alias domain so the SOCKS broker
-    /// recognizes and tunnels them to the remote host (WebKit parity:
-    /// `remoteProxyPreparedRequest`); local panes map alias URLs back to
-    /// localhost so a pane that moved out of a remote workspace keeps working.
-    /// Idempotent in both directions.
-    private func chromiumOutboundURLString(_ urlString: String) -> String {
-        guard let url = URL(string: urlString) else { return urlString }
-        if usesRemoteWorkspaceProxy {
-            guard let rewritten = Self.remoteProxyLoopbackAliasURL(for: url) else { return urlString }
-            return rewritten.absoluteString
-        }
-        guard let display = Self.remoteProxyDisplayURL(for: url) else { return urlString }
-        return display.absoluteString
-    }
-
-    /// The Content Shell adopts its proxy at launch only, so endpoint changes
-    /// cannot be applied to a live session in place. When activation was
-    /// deferred waiting for the endpoint, run it now; when a live session's
-    /// launch proxy no longer matches the desired one (broker port moved on
-    /// reconnect, or the pane moved between local and remote workspaces),
-    /// restart the session at its current URL.
-    private func syncChromiumSessionProxyIfNeeded() {
-        guard engineKind == .chromium else { return }
-        if chromiumActivationWaitingForRemoteProxy {
-            activateChromiumIfNeeded()
-            return
-        }
-        guard let state = chromium, !chromiumDisconnected else { return }
-        let desired = chromiumRemoteProxyServer
-        // A remote pane whose endpoint dropped keeps the stale-proxied session:
-        // restarting without a proxy could not reach the remote host either,
-        // and the endpoint usually returns at the same port after reconnect.
-        if usesRemoteWorkspaceProxy && desired == nil { return }
-        guard desired != chromiumLaunchedProxyServer else { return }
-        lastMirroredChromiumURL = lastMirroredChromiumURL ?? currentURL?.absoluteString
-        state.teardown()
-        chromium = nil
-        chromiumLaunchedProxyServer = nil
-        pendingInitialChromiumURL = lastMirroredChromiumURL
-        activateChromiumIfNeeded()
-    }
-
-    private func startChromiumMirroring(_ state: BrowserPanelChromiumState) {
-        applyChromiumModelState(state.model)
-        observeChromiumModel(state)
-        startChromiumPoll(state)
-        wireChromiumWebViewFocusHooks(state)
-        let coordinator = BrowserChromiumNativeSurfaceCoordinator(
-            session: state.session,
-            hostView: state.webView
-        )
-        state.nativeSurfaceCoordinator = coordinator
-        state.webView.onSurfaceTree = { [weak coordinator, weak self] tree in
-#if DEBUG
-            if let devTools = tree.surfaces.filter({ $0.kind == .devTools }).first {
-                cmuxDebugLog(
-                    "browser.chromium.devtools.surface panel=\(self?.id.uuidString.prefix(5) ?? "?????") " +
-                    "gen=\(tree.generation) visible=\(devTools.visible) " +
-                    "x=\(devTools.x) y=\(devTools.y) w=\(devTools.width) h=\(devTools.height) " +
-                    "surfaces=\(tree.surfaces.map { "\($0.kind)@\($0.width)x\($0.height)v\($0.visible ? 1 : 0)" }.joined(separator: ","))"
-                )
-            }
-#endif
-            coordinator?.handle(tree)
-        }
-    }
-
-    /// Routes the Chromium view's pointer/focus events through the same
-    /// notification path the WebKit engine uses, so pane focus, address-bar
-    /// tracking, and the keyboard-focus coordinator stay in sync regardless of
-    /// engine. Observers identify the panel by its canonical `webView`
-    /// instance, which chromium panels keep as their web-content identity
-    /// token even though it is never mounted.
-    private func wireChromiumWebViewFocusHooks(_ state: BrowserPanelChromiumState) {
-        state.webView.acceptsFirstMouseProvider = { PaneFirstClickFocusSettings.isEnabled() }
-        state.webView.onPointerClick = { [weak self] in
-            guard let self else { return }
-            NotificationCenter.default.post(name: .webViewDidReceiveClick, object: self.webView)
-        }
-        state.webView.onDidBecomeFirstResponder = { [weak self] pointerInitiated in
-            guard let self else { return }
-            self.noteWebViewFocused()
-            NotificationCenter.default.post(
-                name: .browserDidBecomeFirstResponderWebView,
-                object: self.webView,
-                userInfo: [BrowserFirstResponderNotificationUserInfoKey.pointerInitiated: pointerInitiated]
-            )
-        }
-    }
-
-    /// Re-arming `withObservationTracking` loop over the Chromium model. Stops
-    /// re-arming once the session is replaced (`chromium !== state`) or disconnects.
-    private func observeChromiumModel(_ state: BrowserPanelChromiumState) {
-        guard chromium === state else { return }
-        let model = state.model
-        withObservationTracking {
-            _ = model.currentURL
-            _ = model.pageTitle
-            _ = model.isLoading
-            _ = model.isDisconnected
-        } onChange: { [weak self, weak state] in
-            Task { @MainActor in
-                guard let self, let state, self.chromium === state else { return }
-                if state.model.isDisconnected {
-                    self.handleChromiumDisconnected()
-                } else {
-                    self.applyChromiumModelState(state.model)
-                    self.observeChromiumModel(state)
-                }
-            }
-        }
-    }
-
-    /// Whether it is safe to run JavaScript through the Chromium session's
-    /// `shell_execute_javascript` wire call.
-    ///
-    /// That call blocks the pinned `com.cmux.chromium-runtime` thread in a
-    /// nested RunLoop until the shell's main frame replies. A Content Shell
-    /// that is still booting on about:blank (or whose main frame is mid-swap)
-    /// never replies, which wedges the runtime thread — and every queued
-    /// session command for every Chromium surface — until the app restarts.
-    /// Gate all session JavaScript on a real committed, idle navigation.
-    nonisolated static func chromiumSessionJavaScriptIsSafe(
-        committedURLString: String,
-        isLoading: Bool
-    ) -> Bool {
-        guard !isLoading else { return false }
-        let trimmed = committedURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        return !trimmed.isEmpty && trimmed != "about:blank"
-    }
-
-    /// `chromiumSessionJavaScriptIsSafe` evaluated against the live session's
-    /// model, for the poll and the history/reload JavaScript shims.
-    private func chromiumSessionJavaScriptIsSafe(_ state: BrowserPanelChromiumState) -> Bool {
-        Self.chromiumSessionJavaScriptIsSafe(
-            committedURLString: state.model.currentURL,
-            isLoading: state.model.isLoading
-        )
-    }
-
-    /// 1s URL/title poll: Chromium fires navigation events for main-frame loads
-    /// but not every in-page (History API) URL change, so poll to stay current.
-    /// Deliberate exception to the no-sleep-polling rule: the OWL Mojo wire
-    /// exposes no pushState/replaceState or SPA-navigation event today.
-    /// TODO: retire this timer once the runtime surfaces a dedicated
-    /// navigation/URL-change hook (tracked with the CmuxChromium runtime work).
-    private func startChromiumPoll(_ state: BrowserPanelChromiumState) {
-        state.pollTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                if Task.isCancelled { return }
-                guard let self, self.chromium === state, !self.chromiumDisconnected else { return }
-                guard self.chromiumSessionJavaScriptIsSafe(state) else { continue }
-                let session = state.session
-                let href = try? await session.executeJavaScript("window.location.href")
-                let title = try? await session.executeJavaScript("document.title")
-                guard self.chromium === state, !self.chromiumDisconnected else { return }
-                if let href, let decoded = Self.decodeChromiumJSONString(href) {
-                    self.applyChromiumURLString(decoded)
-                }
-                if let title, let decoded = Self.decodeChromiumJSONString(title) {
-                    let trimmed = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty, self.pageTitle != trimmed {
-                        self.pageTitle = trimmed
-                    }
-                }
-            }
-        }
-    }
-
-    private func applyChromiumModelState(_ model: ChromiumBrowserModel) {
-        applyChromiumURLString(model.currentURL)
-        let title = model.pageTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !title.isEmpty, pageTitle != title {
-            pageTitle = title
-        }
-        if isLoading != model.isLoading {
-            isLoading = model.isLoading
-        }
-        // Chromium exposes no canGoBack/canGoForward signal; keep the toolbar
-        // buttons enabled so history.back()/forward() shims remain reachable.
-        if !canGoBack { canGoBack = true }
-        if !canGoForward { canGoForward = true }
-    }
-
-    private func applyChromiumURLString(_ rawURLString: String) {
-        let urlString = rawURLString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !urlString.isEmpty, urlString != blankURLString else { return }
-        lastMirroredChromiumURL = urlString
-        guard let url = URL(string: urlString) else { return }
-        // Remote panes browse the loopback alias domain; the omnibar shows the
-        // localhost form the user typed (WebKit parity: `remoteProxyDisplayURL`).
-        let displayURL = Self.remoteProxyDisplayURL(for: url) ?? url
-        guard currentURL != displayURL else { return }
-        currentURL = displayURL
-    }
-
-    private func handleChromiumDisconnected() {
-        guard let state = chromium, !chromiumDisconnected else { return }
-        lastMirroredChromiumURL = lastMirroredChromiumURL ?? currentURL?.absoluteString
-        state.teardown()
-        chromiumDisconnected = true
-        isLoading = false
-    }
-
-    private func restartChromiumAfterDisconnect() {
-        chromium = nil
-        chromiumDisconnected = false
-        pendingInitialChromiumURL = lastMirroredChromiumURL ?? currentURL?.absoluteString
-        activateChromiumIfNeeded()
-    }
-
-    private static func decodeChromiumJSONString(_ jsonEncoded: String) -> String? {
-        guard let data = jsonEncoded.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(String.self, from: data)
-    }
-
     /// Navigate to a URL
     @discardableResult
     func navigate(
@@ -6458,19 +5987,6 @@ final class BrowserPanel: Panel, ObservableObject {
         recordTypedNavigation: Bool = false,
         onNavigationStarted: ((WKNavigation?) -> Void)? = nil
     ) -> WKNavigation? {
-        if engineKind == .chromium {
-            let urlString = url.absoluteString
-            currentURL = Self.remoteProxyDisplayURL(for: url) ?? url
-            lastMirroredChromiumURL = urlString
-            if let session = chromium?.session, !chromiumDisconnected {
-                let outboundURL = chromiumOutboundURLString(urlString)
-                Task { try? await session.navigate(to: outboundURL) }
-            } else {
-                pendingInitialChromiumURL = urlString
-            }
-            onNavigationStarted?(nil)
-            return nil
-        }
         let request = URLRequest(url: url)
         if shouldBlockInsecureHTTPNavigation(to: url) {
             presentInsecureHTTPAlert(
@@ -7107,13 +6623,6 @@ extension BrowserPanel {
 
     /// Go back in history
     func goBack() {
-        if engineKind == .chromium {
-            if let state = chromium, !chromiumDisconnected, chromiumSessionJavaScriptIsSafe(state) {
-                let session = state.session
-                Task { _ = try? await session.executeJavaScript("history.back()") }
-            }
-            return
-        }
         guard canGoBack else { return }
         reactivateDiscardedWebViewWithoutNavigation(reason: "goBack")
         cancelInFlightNavigationBeforeHistoryTraversal()
@@ -7148,13 +6657,6 @@ extension BrowserPanel {
 
     /// Go forward in history
     func goForward() {
-        if engineKind == .chromium {
-            if let state = chromium, !chromiumDisconnected, chromiumSessionJavaScriptIsSafe(state) {
-                let session = state.session
-                Task { _ = try? await session.executeJavaScript("history.forward()") }
-            }
-            return
-        }
         guard canGoForward else { return }
         reactivateDiscardedWebViewWithoutNavigation(reason: "goForward")
         cancelInFlightNavigationBeforeHistoryTraversal()
@@ -7306,33 +6808,9 @@ extension BrowserPanel {
         return false
     }
 
-    /// Chromium reload path shared by `reload()` and `hardReload()`. When the
-    /// session has no committed navigation (JS would wedge the runtime thread,
-    /// see `chromiumSessionJavaScriptIsSafe`), retry the recorded URL through
-    /// the navigate wire call instead — reload is the user's natural recovery
-    /// action on a tab stuck before its first commit.
-    private func chromiumReload(javaScript: String) {
-        if chromiumDisconnected {
-            restartChromiumAfterDisconnect()
-            return
-        }
-        guard let state = chromium else { return }
-        let session = state.session
-        if chromiumSessionJavaScriptIsSafe(state) {
-            Task { _ = try? await session.executeJavaScript(javaScript) }
-        } else if let target = lastMirroredChromiumURL ?? currentURL?.absoluteString {
-            let outboundURL = chromiumOutboundURLString(target)
-            Task { try? await session.navigate(to: outboundURL) }
-        }
-    }
-
     /// Reload the current page
     @discardableResult
     func reload() -> WKNavigation? {
-        if engineKind == .chromium {
-            chromiumReload(javaScript: "location.reload()")
-            return nil
-        }
         if prepareForReload(reason: "reload", mode: .soft) {
             return nil
         }
@@ -7344,10 +6822,6 @@ extension BrowserPanel {
 
     /// Reload the current page, bypassing WebKit's cache.
     func hardReload() {
-        if engineKind == .chromium {
-            chromiumReload(javaScript: "location.reload(true)")
-            return
-        }
         if prepareForReload(reason: "hardReload", mode: .hard) {
             return
         }
@@ -7356,7 +6830,6 @@ extension BrowserPanel {
 
     /// Stop loading
     func stopLoading() {
-        if engineKind == .chromium { return }
         // Fail closed: a reveal must never blank-shell-heal over an explicit Stop.
         userStoppedLoadSinceWebViewReplacement = true
         webView.stopLoading()
@@ -7594,35 +7067,8 @@ extension BrowserPanel {
         return true
     }
 
-    /// Shared mutation path for chromium DevTools visibility so toggle/show/console
-    /// entry points optimistically flip `chromiumDevToolsVisible` and roll back
-    /// together on failure, instead of each keeping its own copy.
-    private func setChromiumDevToolsVisible(_ visible: Bool) -> Bool {
-        guard let session = chromium?.session, !chromiumDisconnected else { return false }
-        chromiumDevToolsVisible = visible
-        Task {
-            do {
-                if visible {
-                    // Docked (.bottom) DevTools renders as a separate shell surface
-                    // that cmux never composites (only the main web-view context gets
-                    // a CALayerHost), so it shows blank. Open in its own window so the
-                    // shell presents DevTools itself.
-                    try await session.openDevTools(mode: .window)
-                } else {
-                    try await session.closeDevTools()
-                }
-            } catch {
-                chromiumDevToolsVisible = !visible
-            }
-        }
-        return true
-    }
-
     @discardableResult
     func toggleDeveloperTools() -> Bool {
-        if engineKind == .chromium {
-            return setChromiumDevToolsVisible(!chromiumDevToolsVisible)
-        }
 #if DEBUG
         cmuxDebugLog(
             "browser.devtools toggle.begin panel=\(id.uuidString.prefix(5)) " +
@@ -7649,16 +7095,12 @@ extension BrowserPanel {
 
     @discardableResult
     func showDeveloperTools() -> Bool {
-        if engineKind == .chromium {
-            return chromiumDevToolsVisible ? true : setChromiumDevToolsVisible(true)
-        }
         return enqueueDeveloperToolsVisibilityTransition(to: true, source: "show")
     }
 
     @discardableResult
     func showDeveloperToolsConsole() -> Bool {
         guard showDeveloperTools() else { return false }
-        if engineKind == .chromium { return true }
         guard !isDeveloperToolsTransitionInFlight else { return true }
         guard let inspector = webView.cmuxInspectorObject() else { return true }
         // WebKit private inspector API differs by OS; try known console selectors.
@@ -7991,10 +7433,6 @@ extension BrowserPanel {
     func captureAutomationVisibleViewportSnapshot(
         completion: @escaping (Result<NSImage, Error>) -> Void
     ) {
-        if engineKind == .chromium {
-            captureChromiumSurfaceSnapshot(completion: completion)
-            return
-        }
         guard visualAutomationCaptureGate.begin() else {
             completion(.failure(BrowserScreenshotError.captureInProgress))
             return
@@ -8016,27 +7454,6 @@ extension BrowserPanel {
                 completion(result)
             }
         )
-    }
-
-    private func captureChromiumSurfaceSnapshot(
-        completion: @escaping (Result<NSImage, Error>) -> Void
-    ) {
-        guard let session = chromium?.session, !chromiumDisconnected else {
-            completion(.failure(BrowserScreenshotError.emptySnapshot))
-            return
-        }
-        Task { @MainActor in
-            do {
-                let capture = try await session.captureSurfacePNG()
-                guard let image = NSImage(data: capture.pngData) else {
-                    completion(.failure(BrowserScreenshotError.invalidImageRepresentation))
-                    return
-                }
-                completion(.success(image))
-            } catch {
-                completion(.failure(error))
-            }
-        }
     }
 
     private func withVisualAutomationRenderLease<T>(
@@ -8152,27 +7569,7 @@ extension BrowserPanel {
 
     // MARK: - Find in Page
 
-    private func postChromiumUnsupportedFindNotification() {
-        NSSound.beep()
-        TerminalNotificationStore.shared.addNotification(
-            tabId: workspaceId,
-            surfaceId: nil,
-            title: String(
-                localized: "chromium.unsupported.find",
-                defaultValue: "Find on Page isn't available on Chromium surfaces yet"
-            ),
-            subtitle: "",
-            body: "",
-            cooldownKey: "chromium.unsupported.find.\(id.uuidString)",
-            cooldownInterval: 5
-        )
-    }
-
     func startFind() {
-        if engineKind == .chromium {
-            postChromiumUnsupportedFindNotification()
-            return
-        }
         clearBrowserFocusMode(reason: "startFind")
         preferredFocusIntent = .findField
         let created = searchState == nil
@@ -8216,7 +7613,6 @@ extension BrowserPanel {
     }
 
     func findNext() {
-        if engineKind == .chromium { return }
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.applyFindMatchCount(await self.findService.next())
@@ -8224,7 +7620,6 @@ extension BrowserPanel {
     }
 
     func findPrevious() {
-        if engineKind == .chromium { return }
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.applyFindMatchCount(await self.findService.previous())
@@ -8631,7 +8026,7 @@ extension BrowserPanel {
         }
 
         if let window,
-           responderOwnsEngineWebContent(window.firstResponder) {
+           Self.responderChainContains(window.firstResponder, target: webView) {
             return .browser(.webView)
         }
 
@@ -8708,7 +8103,7 @@ extension BrowserPanel {
             return .browser(.findField)
         }
 
-        if responderOwnsEngineWebContent(responder) {
+        if Self.responderChainContains(responder, target: webView) {
             return .browser(.webView)
         }
 
@@ -8742,7 +8137,7 @@ extension BrowserPanel {
 #endif
             return true
         case .webView:
-            guard responderOwnsEngineWebContent(window.firstResponder) else { return false }
+            guard Self.responderChainContains(window.firstResponder, target: webView) else { return false }
             return window.makeFirstResponder(nil)
         }
     }
@@ -8844,11 +8239,6 @@ extension BrowserPanel {
     }
 
     func refreshNavigationAvailability() {
-        if engineKind == .chromium {
-            canGoBack = true
-            canGoForward = true
-            return
-        }
         let availability = restoredSessionHistory.availability(
             nativeCanGoBack: nativeCanGoBack,
             nativeCanGoForward: nativeCanGoForward
@@ -9010,6 +8400,17 @@ private extension BrowserPanel {
         }
     }
 
+    static func responderChainContains(_ start: NSResponder?, target: NSResponder) -> Bool {
+        var r = start
+        var hops = 0
+        while let cur = r, hops < 64 {
+            if cur === target { return true }
+            r = cur.nextResponder
+            hops += 1
+        }
+        return false
+    }
+
     static func visibleDescendants(in root: NSView) -> [NSView] {
         var descendants: [NSView] = []
         var stack = Array(root.subviews.reversed())
@@ -9033,21 +8434,6 @@ private extension BrowserPanel {
 
     static func verticalOverlap(between lhs: NSRect, and rhs: NSRect) -> CGFloat {
         max(0, min(lhs.maxY, rhs.maxY) - max(lhs.minY, rhs.minY))
-    }
-}
-
-extension BrowserPanel {
-    // Internal (not fileprivate): chromium focus routing in
-    // BrowserPanelChromiumFocus.swift walks the same responder chain.
-    static func responderChainContains(_ start: NSResponder?, target: NSResponder) -> Bool {
-        var r = start
-        var hops = 0
-        while let cur = r, hops < 64 {
-            if cur === target { return true }
-            r = cur.nextResponder
-            hops += 1
-        }
-        return false
     }
 }
 

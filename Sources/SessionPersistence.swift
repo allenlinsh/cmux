@@ -1574,10 +1574,6 @@ struct SessionBrowserPanelSnapshot: Codable, Sendable {
     /// and navigating via the custom scheme, independent of the (possibly-dead) local HTTP server.
     var diffViewerToken: String? = nil
     var diffViewerRequestPath: String? = nil
-    /// Persisted engine backing (`BrowserSurfaceEngineKind` raw value). Absent in
-    /// legacy payloads, which restore as WebKit.
-    var engineKind: String? = nil
-
     init(
         urlString: String?,
         profileID: UUID?,
@@ -1590,8 +1586,7 @@ struct SessionBrowserPanelSnapshot: Codable, Sendable {
         forwardHistoryURLStrings: [String]?,
         transparentBackground: Bool? = nil,
         diffViewerToken: String? = nil,
-        diffViewerRequestPath: String? = nil,
-        engineKind: String? = nil
+        diffViewerRequestPath: String? = nil
     ) {
         self.urlString = urlString
         self.profileID = profileID
@@ -1605,7 +1600,6 @@ struct SessionBrowserPanelSnapshot: Codable, Sendable {
         self.transparentBackground = transparentBackground
         self.diffViewerToken = diffViewerToken
         self.diffViewerRequestPath = diffViewerRequestPath
-        self.engineKind = engineKind
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -1621,7 +1615,6 @@ struct SessionBrowserPanelSnapshot: Codable, Sendable {
         case transparentBackground
         case diffViewerToken
         case diffViewerRequestPath
-        case engineKind
     }
 
     init(from decoder: Decoder) throws {
@@ -1638,7 +1631,6 @@ struct SessionBrowserPanelSnapshot: Codable, Sendable {
         transparentBackground = try container.decodeIfPresent(Bool.self, forKey: .transparentBackground)
         diffViewerToken = try container.decodeIfPresent(String.self, forKey: .diffViewerToken)
         diffViewerRequestPath = try container.decodeIfPresent(String.self, forKey: .diffViewerRequestPath)
-        engineKind = try container.decodeIfPresent(String.self, forKey: .engineKind)
     }
 }
 struct SessionMarkdownPanelSnapshot: Codable, Sendable {

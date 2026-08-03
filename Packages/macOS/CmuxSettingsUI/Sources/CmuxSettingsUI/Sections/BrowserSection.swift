@@ -24,7 +24,6 @@ public struct BrowserSection: View {
     @State private var suggestions: DefaultsValueModel<Bool>
     @State private var devHostNoCache: DefaultsValueModel<Bool>
     @State private var theme: DefaultsValueModel<BrowserThemeMode>
-    @State private var engineChoice: DefaultsValueModel<BrowserEngineChoice>
     @State private var discardEnabled: DefaultsValueModel<Bool>
     @State private var discardDelay: DefaultsValueModel<Double>
     @State private var askWhereToSaveDownloads: DefaultsValueModel<Bool>
@@ -57,7 +56,6 @@ public struct BrowserSection: View {
         _suggestions = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.browser.showSearchSuggestions))
         _devHostNoCache = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.browser.disableCacheForDevHosts))
         _theme = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.browser.theme))
-        _engineChoice = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.browser.engineChoice))
         _discardEnabled = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.browser.discardHiddenWebViews))
         _discardDelay = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.browser.hiddenWebViewDiscardDelaySeconds))
         _askWhereToSaveDownloads = State(initialValue: DefaultsValueModel(store: defaultsStore, key: catalog.browser.askWhereToSaveDownloads))
@@ -89,7 +87,7 @@ public struct BrowserSection: View {
             Button(String(localized: "settings.browser.history.clearDialog.cancel", defaultValue: "Cancel"), role: .cancel) {}
         } message: {
             Text(String(localized: "settings.browser.history.clearDialog.message", defaultValue: "This removes visited-page suggestions from the browser omnibar."))
-        }.task { startSettingsObservation([disabled, engine, customName, customURL, suggestions, theme, engineChoice, discardEnabled, discardDelay, askWhereToSaveDownloads, openTermLinks, interceptOpen, hosts, external, httpAllowlist, importHint, reactGrab]) }
+        }.task { startSettingsObservation([disabled, engine, customName, customURL, suggestions, devHostNoCache, theme, discardEnabled, discardDelay, askWhereToSaveDownloads, openTermLinks, interceptOpen, hosts, external, httpAllowlist, importHint, reactGrab]) }
     }
 
     @ViewBuilder
@@ -193,25 +191,6 @@ public struct BrowserSection: View {
             }
             SettingsCardDivider()
 
-            // Browser Engine
-            SettingsCardRow(
-                configurationReview: .json("browser.engine"),
-                String(localized: "settings.browser.engine", defaultValue: "Browser Engine (Experimental)"),
-                subtitle: String(
-                    localized: "settings.browser.engine.subtitle",
-                    defaultValue: "Engine for new browser surfaces. Chromium requires an installed runtime and is experimental."
-                ),
-                controlWidth: Self.columnWidth
-            ) {
-                Picker("", selection: Binding(get: { engineChoice.current }, set: { engineChoice.set($0) })) {
-                    Text(String(localized: "settings.browser.engine.webkit", defaultValue: "WebKit (System)")).tag(BrowserEngineChoice.webkit)
-                    Text(String(localized: "settings.browser.engine.chromium", defaultValue: "Chromium (Experimental)")).tag(BrowserEngineChoice.chromium)
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .accessibilityIdentifier("BrowserEngineChoicePicker")
-            }
-            SettingsCardDivider()
 
             // Browser Memory Saver
             SettingsCardRow(
