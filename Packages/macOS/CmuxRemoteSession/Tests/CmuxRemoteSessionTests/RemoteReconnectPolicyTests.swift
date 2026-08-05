@@ -276,9 +276,146 @@ struct RemoteReconnectPolicyTests {
         #expect(state.2)
     }
 
+    @Test("System wake forces reconnect for a still-ready proxy-backed SSH session")
+    func systemWakeForcesReconnectForStillReadyProxySession() {
+        let provider = IntentionalCleanupTestTunnelProvider()
+        let coordinator = makeCoordinator(
+            broker: RemoteProxyBroker(tunnelProvider: provider)
+        )
+        defer {
+            coordinator.stop()
+            coordinator.queue.sync {}
+            provider.tunnel.stop()
+        }
+        coordinator.queue.sync {
+            coordinator.isSystemSleeping = true
+            coordinator.daemonReady = true
+            coordinator.proxyEndpoint = BrowserProxyEndpoint(host: "127.0.0.1", port: 41_414)
+            coordinator.reconnectRetryCount = 0
+            coordinator.reconnectSuspended = false
+        }
+
+        coordinator.resetReconnectPolicyAndReconnect(reason: "system wake")
+        coordinator.queue.sync {}
+
+        let state = coordinator.queue.sync {
+            (
+                coordinator.daemonReady,
+                coordinator.proxyEndpoint,
+                coordinator.reconnectRetryCount,
+                coordinator.reconnectToken != nil
+            )
+        }
+        #expect(!state.0)
+        #expect(state.1 == nil)
+        #expect(state.2 == 1)
+        #expect(state.3)
+    }
+
+    @Test("Unreachable probes inside post-rearm grace do not suspend the loop")
+    func postRearmGraceBlocksSuspend() {
+        let provider = IntentionalCleanupTestTunnelProvider()
+        let coordinator = makeCoordinator(
+            broker: RemoteProxyBroker(tunnelProvider: provider)
+        )
+        defer {
+            coordinator.stop()
+            coordinator.queue.sync {}
+            provider.tunnel.stop()
+        }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        coordinator.queue.sync {
+            coordinator.reconnectNow = { now }
+            coordinator.reconnectSuspendGraceUntil = now.addingTimeInterval(90)
+            coordinator.reconnectToken = UUID()
+            coordinator.consecutiveUnreachableProbeCount =
+                policy.maxConsecutiveUnreachableProbes - 1
+        }
+
+        coordinator.queue.sync {
+            coordinator.handleReachabilityProbeOutcomeLocked(
+                .unreachable(reason: "probe timed out"),
+                generation: coordinator.reachabilityProbeGeneration
+            )
+        }
+
+        let state = coordinator.queue.sync {
+            (
+                coordinator.reconnectSuspended,
+                coordinator.consecutiveUnreachableProbeCount,
+                coordinator.suspendedReachabilityProbeToken
+            )
+        }
+        #expect(!state.0)
+        #expect(state.1 == policy.maxConsecutiveUnreachableProbes - 1)
+        #expect(state.2 == nil)
+    }
+
+    @Test("Suspended host becoming reachable auto re-arms reconnect")
+    func suspendedHostReachableAutoRearms() {
+        let provider = IntentionalCleanupTestTunnelProvider()
+        let coordinator = makeCoordinator(
+            broker: RemoteProxyBroker(tunnelProvider: provider)
+        )
+        defer {
+            coordinator.stop()
+            coordinator.queue.sync {}
+            provider.tunnel.stop()
+        }
+        coordinator.queue.sync {
+            coordinator.reconnectSuspended = true
+            coordinator.daemonReady = false
+            coordinator.proxyEndpoint = nil
+            coordinator.consecutiveUnreachableProbeCount = policy.maxConsecutiveUnreachableProbes
+            coordinator.handleSuspendedReachabilityProbeOutcomeLocked(
+                .reachable,
+                generation: coordinator.reachabilityProbeGeneration
+            )
+        }
+
+        let state = coordinator.queue.sync {
+            (
+                coordinator.reconnectSuspended,
+                coordinator.reconnectRetryCount,
+                coordinator.reconnectToken != nil,
+                coordinator.consecutiveUnreachableProbeCount
+            )
+        }
+        #expect(!state.0)
+        #expect(state.1 == 1)
+        #expect(state.2)
+        #expect(state.3 == 0)
+    }
+
+    @Test("Suspended unreachable probe reschedules another low-rate probe")
+    func suspendedUnreachableReschedulesProbe() {
+        let provider = IntentionalCleanupTestTunnelProvider()
+        let coordinator = makeCoordinator(
+            broker: RemoteProxyBroker(tunnelProvider: provider)
+        )
+        defer {
+            coordinator.stop()
+            coordinator.queue.sync {}
+            provider.tunnel.stop()
+        }
+        coordinator.queue.sync {
+            coordinator.reconnectSuspended = true
+            coordinator.handleSuspendedReachabilityProbeOutcomeLocked(
+                .unreachable(reason: "no route"),
+                generation: coordinator.reachabilityProbeGeneration
+            )
+        }
+
+        let token = coordinator.queue.sync { coordinator.suspendedReachabilityProbeToken }
+        #expect(token != nil)
+        #expect(coordinator.queue.sync { coordinator.reconnectSuspended })
+    }
+
     private func makeCoordinator(
         broker: RemoteProxyBroker,
-        configuration: WorkspaceRemoteConfiguration? = nil
+        configuration: WorkspaceRemoteConfiguration? = nil,
+        reachabilityProbe: any RemoteHostReachabilityProbing = IntentionalCleanupNoopReachabilityProbe(),
+        clock: any RemoteProxyRetryClock = SystemRemoteProxyRetryClock()
     ) -> RemoteSessionCoordinator {
         let configuration = configuration ?? WorkspaceRemoteConfiguration(
             destination: "user@example.test",
@@ -303,7 +440,7 @@ struct RemoteReconnectPolicyTests {
                 homeDirectory: FileManager.default.temporaryDirectory
             ),
             processRunner: IntentionalCleanupUnusedProcessRunner(),
-            reachabilityProbe: IntentionalCleanupNoopReachabilityProbe(),
+            reachabilityProbe: reachabilityProbe,
             relayCommandRewriter: IntentionalCleanupRelayCommandRewriter(),
             buildInfo: IntentionalCleanupBuildInfo(),
             daemonStrings: RemoteDaemonStrings(
@@ -316,7 +453,8 @@ struct RemoteReconnectPolicyTests {
                 reverseRelayUnavailableRetrying: "",
                 reverseRelayPortUnavailableRetrying: "",
                 controlMasterOwnershipUnavailable: ""
-            )
+            ),
+            clock: clock
         )
     }
 }

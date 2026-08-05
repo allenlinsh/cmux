@@ -122,6 +122,13 @@ public final class RemoteSessionCoordinator: @unchecked Sendable {
     var reconnectSuspended = false
     var isSystemSleeping = false
     var reachabilityProbeGeneration: UInt64 = 0
+    /// After wake / path re-arm, unreachable probes must not suspend until this time.
+    /// Tailscale and Wi-Fi often need longer than three short TCP probes to recover.
+    var reconnectSuspendGraceUntil: Date?
+    /// Wall-clock seam for suspend-grace tests (`Date()` in production).
+    var reconnectNow: () -> Date = { Date() }
+    var suspendedReachabilityProbeTask: Task<Void, Never>?
+    var suspendedReachabilityProbeToken: UUID?
     var heartbeatCount: Int = 0
     var connectionAttemptStartedAt: Date?
     var pendingPTYBridgeStarts: [UUID: PendingPTYBridgeStart] = [:]
@@ -390,11 +397,13 @@ public final class RemoteSessionCoordinator: @unchecked Sendable {
         case .ready(let endpoint):
             debugLog("remote.proxy.ready host=\(endpoint.host) port=\(endpoint.port) \(debugConfigSummary())")
             cancelReconnectRetryLocked()
+            cancelSuspendedReachabilityProbeLocked()
             reconnectRetryCount = 0
             consecutiveUnreachableProbeCount = 0
             // A live connection ends any suspension; without this a future
             // failure would hit the suspended guard and never reschedule.
             reconnectSuspended = false
+            reconnectSuspendGraceUntil = nil
             reachabilityProbeGeneration &+= 1
             guard proxyEndpoint != endpoint else {
                 publishState(
