@@ -17,9 +17,11 @@ extension RemoteSessionCoordinator {
         isStopping = true
         cancelConnectionAttemptLocked()
         cancelReconnectRetryLocked()
+        cancelSuspendedReachabilityProbeLocked()
         reconnectRetryCount = 0
         consecutiveUnreachableProbeCount = 0
         reconnectSuspended = false
+        reconnectSuspendGraceUntil = nil
         reachabilityProbeGeneration &+= 1
         cancelControlMasterReapObservationLocked()
         cancelReverseRelayRestartLocked()

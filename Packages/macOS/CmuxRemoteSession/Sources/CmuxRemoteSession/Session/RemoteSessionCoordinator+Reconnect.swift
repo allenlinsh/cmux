@@ -5,7 +5,20 @@ internal import Foundation
 // legacy `asyncAfter` work item became an injected-clock task whose wakeup is
 // guarded by a token (strictly tighter than the legacy work-item cancel) —
 // delays, retry numbering, and suffix strings are identical.
+//
+// Post-#5734 recovery gaps for sleep / Tailscale:
+// - After wake or network re-arm, unreachable probes do not suspend for
+//   `postRearmSuspendGraceSeconds` so short settle windows (Wi-Fi, Tailscale)
+//   do not strand the workspace on a manual Reconnect.
+// - Once suspended, a low-rate reachability probe keeps watching the host and
+//   auto re-arms when it becomes reachable again (path monitor alone misses
+//   cases where the default path stays "satisfied" while the SSH route is not).
 extension RemoteSessionCoordinator {
+    /// How long after an external re-arm unreachable probes may not suspend.
+    static let postRearmSuspendGraceSeconds: TimeInterval = 90
+    /// Interval between reachability probes while auto-reconnect is suspended.
+    static let suspendedReachabilityProbeIntervalSeconds: TimeInterval = 15
+
     @discardableResult
     func scheduleReconnectLocked(baseDelay: TimeInterval) -> RetrySchedule {
         let retryNumber = reconnectRetryCount + 1
@@ -52,6 +65,12 @@ extension RemoteSessionCoordinator {
         reconnectToken = nil
     }
 
+    func cancelSuspendedReachabilityProbeLocked() {
+        suspendedReachabilityProbeTask?.cancel()
+        suspendedReachabilityProbeTask = nil
+        suspendedReachabilityProbeToken = nil
+    }
+
     /// Probe whether the SSH endpoint is reachable at all after a failed
     /// connection attempt. While the host stays unreachable the retry loop is
     /// allowed a short streak of attempts (absorbing sleep/wake and network
@@ -88,21 +107,37 @@ extension RemoteSessionCoordinator {
             previousConsecutiveUnreachableProbes: consecutiveUnreachableProbeCount
         )
         consecutiveUnreachableProbeCount = evaluation.consecutiveUnreachableProbes
+        let inSuspendGrace = isWithinReconnectSuspendGraceLocked()
+        let shouldSuspend = evaluation.decision == .suspend && !inSuspendGrace
         debugLog(
             "remote.session.reachability outcome=\(Self.debugDescription(for: outcome)) " +
             "streak=\(evaluation.consecutiveUnreachableProbes) " +
-            "decision=\(evaluation.decision == .suspend ? "suspend" : "retry") \(debugConfigSummary())"
+            "decision=\(shouldSuspend ? "suspend" : "retry") " +
+            "grace=\(inSuspendGrace ? 1 : 0) \(debugConfigSummary())"
         )
-        if evaluation.decision == .suspend {
+        if shouldSuspend {
             suspendAutoReconnectLocked()
+        } else if evaluation.decision == .suspend, inSuspendGrace {
+            // Keep aggressive backoff alive while network settles after wake/path rearm.
+            consecutiveUnreachableProbeCount = max(0, reconnectPolicy.maxConsecutiveUnreachableProbes - 1)
         }
     }
 
-    /// Halt the automatic reconnect loop and surface a suspended state with a
-    /// manual Reconnect affordance. `Workspace.reconnectRemoteConnection()`
-    /// (sidebar button, workspace context menu, `cmux workspace reconnect`,
-    /// and the `workspace.remote.reconnect` socket command) replaces this
-    /// coordinator, which resets the policy state.
+    func isWithinReconnectSuspendGraceLocked() -> Bool {
+        guard let reconnectSuspendGraceUntil else { return false }
+        return reconnectNow() < reconnectSuspendGraceUntil
+    }
+
+    /// Halt the aggressive reconnect loop and surface a suspended state with a
+    /// manual Reconnect affordance. A low-rate reachability probe keeps
+    /// watching the host and auto re-arms when it becomes reachable again —
+    /// needed when Tailscale / sleep recovery takes longer than the active
+    /// retry window and NWPathMonitor does not report a further path change.
+    ///
+    /// `Workspace.reconnectRemoteConnection()` (sidebar button, workspace
+    /// context menu, `cmux workspace reconnect`, and the
+    /// `workspace.remote.reconnect` socket command) still replaces this
+    /// coordinator immediately.
     func suspendAutoReconnectLocked() {
         cancelReconnectRetryLocked()
         reconnectSuspended = true
@@ -113,6 +148,63 @@ extension RemoteSessionCoordinator {
         let detail = String(format: strings.suspendedDetailFormat, configuration.displayTarget)
         publishDaemonStatus(.unavailable, detail: detail)
         publishState(.suspended, detail: detail)
+        scheduleSuspendedReachabilityProbeLocked()
+    }
+
+    func scheduleSuspendedReachabilityProbeLocked() {
+        guard configuration.transport == .ssh else { return }
+        cancelSuspendedReachabilityProbeLocked()
+        let token = UUID()
+        suspendedReachabilityProbeToken = token
+        let milliseconds = Int((Self.suspendedReachabilityProbeIntervalSeconds * 1000).rounded(.up))
+        suspendedReachabilityProbeTask = Task { [weak self] in
+            guard let self else { return }
+            guard (try? await self.clock.sleep(forMilliseconds: milliseconds)) != nil else { return }
+            self.queue.async {
+                self.suspendedReachabilityProbeElapsedLocked(token: token)
+            }
+        }
+    }
+
+    func suspendedReachabilityProbeElapsedLocked(token: UUID) {
+        guard suspendedReachabilityProbeToken == token else { return }
+        suspendedReachabilityProbeTask = nil
+        suspendedReachabilityProbeToken = nil
+        guard !isStopping, reconnectSuspended, !isSystemSleeping else { return }
+        reachabilityProbeGeneration &+= 1
+        let generation = reachabilityProbeGeneration
+        reachabilityProbe.probe(
+            destination: configuration.destination,
+            port: configuration.port,
+            identityFile: configuration.identityFile,
+            sshOptions: configuration.sshOptions
+        ) { [weak self] outcome in
+            guard let self else { return }
+            self.queue.async {
+                self.handleSuspendedReachabilityProbeOutcomeLocked(outcome, generation: generation)
+            }
+        }
+    }
+
+    func handleSuspendedReachabilityProbeOutcomeLocked(
+        _ outcome: RemoteHostProbeOutcome,
+        generation: UInt64
+    ) {
+        guard generation == reachabilityProbeGeneration else { return }
+        guard !isStopping, reconnectSuspended, !isSystemSleeping else { return }
+        debugLog(
+            "remote.session.reachability.suspended outcome=\(Self.debugDescription(for: outcome)) " +
+            debugConfigSummary()
+        )
+        switch outcome {
+        case .reachable:
+            let shouldReconnect = resetReconnectPolicyLocked(reason: "suspended host became reachable")
+            guard shouldReconnect else { return }
+            resetTransportForReconnectLocked()
+            _ = scheduleReconnectLocked(baseDelay: 2.0)
+        case .unreachable, .indeterminate:
+            scheduleSuspendedReachabilityProbeLocked()
+        }
     }
 
     static func debugDescription(for outcome: RemoteHostProbeOutcome) -> String {

@@ -11,8 +11,11 @@ extension RemoteSessionCoordinator {
     /// Clears any terminal reconnect suspension after an external re-arm signal.
     ///
     /// A reconnect is scheduled when the coordinator was suspended or no longer
-    /// has a ready proxy. Healthy connections are left in place; a transport
-    /// failure delivered after wake will schedule through the freshly reset policy.
+    /// has a ready proxy. System wake also forces a transport reset for proxy-
+    /// backed SSH sessions: long sleep often leaves a still-marked-ready proxy
+    /// whose TCP path is already dead (common with Tailscale after lid open).
+    /// Network-path re-arms keep the healthy-proxy skip so flapping interfaces
+    /// do not tear down live sessions.
     ///
     /// - Parameter reason: A diagnostic label for the re-arm signal.
     public func resetReconnectPolicyAndReconnect(reason: String) {
@@ -29,6 +32,7 @@ extension RemoteSessionCoordinator {
         guard !isStopping else { return }
         isSystemSleeping = true
         cancelReconnectRetryLocked()
+        cancelSuspendedReachabilityProbeLocked()
         reachabilityProbeGeneration &+= 1
         debugLog("remote.session.systemSleep \(debugConfigSummary())")
     }
@@ -38,14 +42,25 @@ extension RemoteSessionCoordinator {
         guard !isStopping else { return false }
         let expectsProxyEndpoint = !configuration.skipDaemonBootstrap ||
             configuration.daemonWebSocketEndpoint != nil
-        let shouldReconnect = reconnectSuspended || reconnectRetryCount > 0 ||
-            (expectsProxyEndpoint && proxyEndpoint == nil) || !daemonReady
+        // Long sleep commonly freezes a still-ready proxy whose TCP path is
+        // already dead; wake must rebuild it instead of waiting for a late error.
+        let forceReconnectAfterSystemWake = expectsProxyEndpoint &&
+            reason == "system wake"
+        let shouldReconnect = forceReconnectAfterSystemWake ||
+            reconnectSuspended ||
+            reconnectRetryCount > 0 ||
+            (expectsProxyEndpoint && proxyEndpoint == nil) ||
+            !daemonReady
         isSystemSleeping = false
         cancelReconnectRetryLocked()
+        cancelSuspendedReachabilityProbeLocked()
         reconnectRetryCount = 0
         consecutiveUnreachableProbeCount = 0
         reconnectSuspended = false
         reachabilityProbeGeneration &+= 1
+        reconnectSuspendGraceUntil = reconnectNow().addingTimeInterval(
+            Self.postRearmSuspendGraceSeconds
+        )
         debugLog(
             "remote.session.reconnect.rearmed reason=\(reason.debugLogSnippet(limit: 80)) " +
                 "reconnect=\(shouldReconnect ? 1 : 0) \(debugConfigSummary())"
