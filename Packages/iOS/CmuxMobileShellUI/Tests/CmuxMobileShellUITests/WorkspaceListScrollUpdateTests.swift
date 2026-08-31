@@ -331,6 +331,75 @@ import UIKit
         #expect(identifiers.contains("MobileWorkspaceRenameButton-workspace-1"))
     }
 
+    @Test func workspaceContextMenuOffersMoveToGroupPicker() {
+        let capabilities = MobileWorkspaceActionCapabilities(
+            supportsWorkspaceActions: false,
+            supportsWorkspaceMetadata: false,
+            supportsReadStateActions: false,
+            supportsCloseActions: false,
+            supportsMoveActions: true,
+            supportsGroupActions: false,
+            supportsGroupCreate: false
+        )
+        let group = MobileWorkspaceGroupPreview(
+            id: "group-1",
+            name: "Release",
+            anchorWorkspaceID: "anchor-1"
+        )
+        var anchor = MobileWorkspacePreview(
+            id: "anchor-1",
+            name: "anchor-1",
+            groupID: group.id,
+            terminals: []
+        )
+        anchor.actionCapabilities = capabilities
+        var grouped = MobileWorkspacePreview(
+            id: "workspace-2",
+            name: "workspace-2",
+            groupID: group.id,
+            terminals: []
+        )
+        grouped.actionCapabilities = capabilities
+        var root = MobileWorkspacePreview(id: "workspace-1", name: "workspace-1", terminals: [])
+        root.actionCapabilities = capabilities
+        let snapshot = [anchor, grouped, root]
+
+        var initial = configuration(workspaces: snapshot, groups: [group])
+        var moves: [(MobileWorkspacePreview.ID, MobileWorkspaceGroupPreview.ID?)] = []
+        initial.groupMoveMenu = { workspaceID in
+            let menu = MobileWorkspaceGroupMoveMenu(
+                workspaces: snapshot,
+                groups: [group],
+                movedWorkspaceID: workspaceID
+            )
+            return menu.isEmpty ? nil : menu
+        }
+        initial.moveToGroup = { workspaceID, groupID in
+            moves.append((workspaceID, groupID))
+        }
+        let coordinator = WorkspaceListTableCoordinator(configuration: initial)
+        let sourceView = UIView()
+
+        let rootIdentifiers = menuActionIdentifiers(
+            in: coordinator.contextMenuActions(for: root, sourceView: sourceView)
+        )
+        #expect(rootIdentifiers.contains("MobileWorkspaceMoveToGroupTarget-workspace-1-group-1"))
+        #expect(!rootIdentifiers.contains("MobileWorkspaceRemoveFromGroupButton-workspace-1"))
+
+        let groupedIdentifiers = menuActionIdentifiers(
+            in: coordinator.contextMenuActions(for: grouped, sourceView: sourceView)
+        )
+        #expect(groupedIdentifiers.contains("MobileWorkspaceMoveToGroupTarget-workspace-2-group-1"))
+        #expect(groupedIdentifiers.contains("MobileWorkspaceRemoveFromGroupButton-workspace-2"))
+
+        // Anchors move with their group; the picker must not appear at all.
+        let anchorIdentifiers = menuActionIdentifiers(
+            in: coordinator.contextMenuActions(for: anchor, sourceView: sourceView)
+        )
+        #expect(!anchorIdentifiers.contains { $0.hasPrefix("MobileWorkspaceMoveToGroup") })
+        #expect(moves.isEmpty)
+    }
+
     @Test func groupHeaderReloadsNativeActionsWhenAnchorReadStateChanges() {
         let group = MobileWorkspaceGroupPreview(
             id: "group-1",
@@ -342,14 +411,14 @@ import UIKit
             groups: [group],
             items: [.groupHeader(group.id)],
             workspaceHasUnread: false,
-            groupHasUnreadByID: [group.id: true]
+            groupUnreadByID: [group.id: .init(isUnread: true, count: nil)]
         )
         let unread = configuration(
             workspaceIDs: ["workspace-1", "workspace-2"],
             groups: [group],
             items: [.groupHeader(group.id)],
             workspaceHasUnread: true,
-            groupHasUnreadByID: [group.id: true]
+            groupUnreadByID: [group.id: .init(isUnread: true, count: nil)]
         )
         let coordinator = WorkspaceListTableCoordinator(configuration: read)
 
@@ -405,7 +474,7 @@ import UIKit
             items: [.groupHeader(group.id)],
             actionCapabilities: capabilities,
             workspaceHasUnread: false,
-            groupHasUnreadByID: [group.id: false],
+            groupUnreadByID: [group.id: .read],
             setUnread: { _, _ in }
         )
         let unread = configuration(
@@ -414,7 +483,7 @@ import UIKit
             items: [.groupHeader(group.id)],
             actionCapabilities: capabilities,
             workspaceHasUnread: true,
-            groupHasUnreadByID: [group.id: true],
+            groupUnreadByID: [group.id: .init(isUnread: true, count: nil)],
             setUnread: { _, _ in }
         )
         let coordinator = WorkspaceListTableCoordinator(configuration: read)
@@ -608,7 +677,7 @@ import UIKit
         items: [WorkspaceListTableItem]? = nil,
         actionCapabilities: MobileWorkspaceActionCapabilities = .none,
         workspaceHasUnread: Bool = false,
-        groupHasUnreadByID: [MobileWorkspaceGroupPreview.ID: Bool] = [:],
+        groupUnreadByID: [MobileWorkspaceGroupPreview.ID: MobileWorkspaceUnreadState] = [:],
         closeWorkspace: ((MobileWorkspacePreview.ID) -> Void)? = nil,
         setUnread: ((MobileWorkspacePreview.ID, Bool) -> Void)? = nil,
         setPinned: ((MobileWorkspacePreview.ID, Bool) -> Void)? = nil,
@@ -637,7 +706,7 @@ import UIKit
             workspaces: workspaces,
             groups: groups,
             items: items,
-            groupHasUnreadByID: groupHasUnreadByID,
+            groupUnreadByID: groupUnreadByID,
             closeWorkspace: closeWorkspace,
             setUnread: setUnread,
             setPinned: setPinned,
@@ -658,7 +727,7 @@ import UIKit
         workspaces: [MobileWorkspacePreview],
         groups: [MobileWorkspaceGroupPreview] = [],
         items: [WorkspaceListTableItem]? = nil,
-        groupHasUnreadByID: [MobileWorkspaceGroupPreview.ID: Bool] = [:],
+        groupUnreadByID: [MobileWorkspaceGroupPreview.ID: MobileWorkspaceUnreadState] = [:],
         closeWorkspace: ((MobileWorkspacePreview.ID) -> Void)? = nil,
         setUnread: ((MobileWorkspacePreview.ID, Bool) -> Void)? = nil,
         setPinned: ((MobileWorkspacePreview.ID, Bool) -> Void)? = nil,
@@ -677,13 +746,14 @@ import UIKit
             items: items ?? workspaces.map { .workspace($0.id, indented: false) },
             workspacesByID: Dictionary(uniqueKeysWithValues: workspaces.map { ($0.id, $0) }),
             groupsByID: Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0) }),
-            groupHasUnreadByID: groupHasUnreadByID,
+            groupUnreadByID: groupUnreadByID,
             filter: .all,
             selectedWorkspaceID: nil,
             navigationStyle: .push,
             wrapWorkspaceTitles: false,
             previewLineLimit: 2,
             unreadIndicatorLeftShift: 0,
+            unreadBadgeDiameter: 16,
             connectionStatus: .connected,
             workspaceChangesCapable: false,
             workspaceChangeChipsByWorkspaceID: [:],

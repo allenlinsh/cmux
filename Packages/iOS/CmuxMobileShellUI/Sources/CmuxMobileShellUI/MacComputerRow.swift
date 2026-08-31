@@ -23,9 +23,10 @@ struct MacComputerRow: View {
     }
 
     let computer: MacComputerSnapshot
-    /// Hides this computer on the current iPhone. When `nil`, hide affordances
-    /// are omitted.
-    var hide: ((String) -> Void)? = nil
+    /// Changes whether this computer appears on the current iPhone. When `nil`,
+    /// the visibility switch is omitted.
+    var setVisible: ((Bool) -> Void)? = nil
+    var isVisibilityMutating = false
     var style: Style = .computers
     /// Reconnect action for `.reconnect` rows; tapping the row calls this with
     /// the device id instead of navigating.
@@ -36,22 +37,30 @@ struct MacComputerRow: View {
     var isConnecting: Bool = false
 
     var body: some View {
-        rowContainer
-        .contextMenu { hideMenuButton }
-        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-            hideSwipeButton
+        HStack(spacing: 8) {
+            rowContainer
+            if let setVisible {
+                ComputerVisibilityToggle(
+                    computerID: computer.id,
+                    computerName: computer.title,
+                    isVisible: true,
+                    isDisabled: isVisibilityMutating,
+                    setVisible: setVisible
+                )
+            }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("MobileComputerRow-\(computer.id)")
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("MobileComputerRow-\(computer.connectionRef.automationID)")
     }
 
     @ViewBuilder
     private var rowContainer: some View {
         switch style {
         case .computers:
-            NavigationLink(value: computer.id) {
+            NavigationLink(value: computer.connectionRef) {
                 rowLabel
             }
+            .accessibilityElement(children: .combine)
         case .reconnect:
             Button {
                 connect?(computer.id)
@@ -59,6 +68,7 @@ struct MacComputerRow: View {
                 rowLabel
             }
             .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
         }
     }
 
@@ -98,39 +108,29 @@ struct MacComputerRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
+            caffeineIndicator
             badge
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
     }
 
+    /// Small cup marking a Mac that cmux is keeping awake. The snapshot only
+    /// carries the state over a live connection, so a stale cup can't linger
+    /// on an unreachable Mac.
     @ViewBuilder
-    private var hideSwipeButton: some View {
-        if let hide {
-            Button {
-                hide(computer.id)
-            } label: {
-                Label(
-                    L10n.string("mobile.computers.hide", defaultValue: "Hide"),
-                    systemImage: "eye.slash"
+    private var caffeineIndicator: some View {
+        if computer.caffeineEnabled == true {
+            Image(systemName: "cup.and.saucer.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .accessibilityLabel(L10n.string(
+                    "mobile.computers.keepAwake.active",
+                    defaultValue: "Keeping Mac awake"
+                ))
+                .accessibilityIdentifier(
+                    "MobileComputerCaffeine-\(computer.connectionRef.automationID)"
                 )
-            }
-            .accessibilityIdentifier("MobileComputerHideSwipeButton-\(computer.id)")
-        }
-    }
-
-    @ViewBuilder
-    private var hideMenuButton: some View {
-        if let hide {
-            Button {
-                hide(computer.id)
-            } label: {
-                Label(
-                    L10n.string("mobile.computers.hide", defaultValue: "Hide"),
-                    systemImage: "eye.slash"
-                )
-            }
-            .accessibilityIdentifier("MobileComputerHideMenuButton-\(computer.id)")
         }
     }
 
@@ -150,7 +150,9 @@ struct MacComputerRow: View {
                 .font(.caption2)
                 .foregroundStyle(dotColor)
                 .accessibilityLabel(primaryStatusPhrase)
-                .accessibilityIdentifier("MobileComputerStatus-\(computer.id)-\(statusIdentifierSuffix)")
+                .accessibilityIdentifier(
+                    "MobileComputerStatus-\(computer.connectionRef.automationID)-\(statusIdentifierSuffix)"
+                )
         }
     }
 
@@ -177,7 +179,8 @@ struct MacComputerRow: View {
     /// connection on the Computers screen, presence on the reconnect list.
     private var statusIdentifierSuffix: String {
         switch style {
-        case .computers: return isConnected ? "connected" : "disconnected"
+        case .computers:
+            return isConnected ? "connected" : "disconnected"
         case .reconnect: return computer.presence == .online ? "online" : "offline"
         }
     }

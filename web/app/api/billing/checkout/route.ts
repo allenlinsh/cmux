@@ -1,5 +1,5 @@
 import type { StackServerApp } from "@stackframe/stack";
-import { NextRequest, NextResponse } from "next/server";
+import { after, NextRequest, NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 
 import { validatedNativeCallbackScheme } from "../../../lib/native-callback";
@@ -26,8 +26,8 @@ import {
   billingInterval,
   type BillingInterval,
 } from "../../../../services/billing/plans";
+import { captureBillingCheckoutStarted } from "../../../../services/analytics/stripeBilling";
 
-export const dynamic = "force-dynamic";
 
 type CheckoutStackServerApp = StackServerApp<true>;
 
@@ -135,32 +135,35 @@ async function stripeProCheckout(
   interval: BillingInterval,
   callbackScheme: string,
 ) {
-  const user =
-    (await stackServerApp.getUser({ or: "return-null" })) ??
-    (await stackServerApp.getUser({ or: "anonymous" }));
-  if (isAccountDeletionInProgress(user)) {
-    return accountDeletionCheckoutRedirect(request);
-  }
-
-  const status = await resolveProPlanStatus(user);
-  if (status.isPro) {
-    return NextResponse.redirect(new URL("/pricing?welcome=active", request.url));
-  }
-
-  const successUrl =
-    `${request.nextUrl.origin}/api/billing/complete` +
-    `?session_id={CHECKOUT_SESSION_ID}&cmux_scheme=${encodeURIComponent(callbackScheme)}`;
-  const cancelUrl = new URL("/pricing?billing=cancelled", request.nextUrl.origin);
-  cancelUrl.searchParams.set("interval", interval);
-  const metadata = {
-    stackUserId: user.id,
-    plan: "pro",
-    app: "cmux",
-    billingInterval: interval,
-    nativeCallbackScheme: callbackScheme,
-  };
-
   try {
+    const user =
+      (await stackServerApp.getUser({ or: "return-null" })) ??
+      (await stackServerApp.getUser({ or: "anonymous" }));
+    if (isAccountDeletionInProgress(user)) {
+      return accountDeletionCheckoutRedirect(request);
+    }
+    // `or: "anonymous"` creates/returns the real Stack anonymous principal.
+    // Keep that id as the source of truth for Stripe and checkout analytics.
+    const stackUserId = checkoutPrincipalId(user.id, "user");
+
+    const status = await resolveProPlanStatus(user);
+    if (status.isPro) {
+      return NextResponse.redirect(new URL("/pricing?welcome=active", request.url));
+    }
+
+    const successUrl =
+      `${request.nextUrl.origin}/api/billing/complete` +
+      `?session_id={CHECKOUT_SESSION_ID}&cmux_scheme=${encodeURIComponent(callbackScheme)}`;
+    const cancelUrl = new URL("/pricing?billing=cancelled", request.nextUrl.origin);
+    cancelUrl.searchParams.set("interval", interval);
+    const metadata = {
+      stackUserId,
+      plan: "pro",
+      app: "cmux",
+      billingInterval: interval,
+      nativeCallbackScheme: callbackScheme,
+    };
+
     const session = await stripe().checkout.sessions.create({
       mode: "subscription",
       line_items: [
@@ -169,7 +172,7 @@ async function stripeProCheckout(
           quantity: 1,
         },
       ],
-      client_reference_id: user.id,
+      client_reference_id: stackUserId,
       metadata,
       subscription_data: { metadata },
       customer_email: !user.isAnonymous && user.primaryEmail ? user.primaryEmail : undefined,
@@ -177,7 +180,15 @@ async function stripeProCheckout(
       success_url: successUrl,
       cancel_url: cancelUrl.toString(),
     });
-    if (!session.url) throw new Error("Stripe Checkout Session did not include a URL");
+    if (!usableCheckoutSession(session)) {
+      throw new Error("Stripe Checkout Session did not include an id and URL");
+    }
+    deferCheckoutAnalytics(() => captureBillingCheckoutStarted({
+      sessionId: session.id,
+      subject: { scope: "user", stackUserId },
+      plan: "pro",
+      billingInterval: interval,
+    }));
     return NextResponse.redirect(session.url);
   } catch (error) {
     captureBillingError(error, {
@@ -195,33 +206,33 @@ async function stripeTeamCheckout(
   interval: BillingInterval,
   callbackScheme: string,
 ) {
-  const user =
-    (await stackServerApp.getUser({ or: "return-null" })) ??
-    (await stackServerApp.getUser({ or: "anonymous" }));
-  if (isAccountDeletionInProgress(user)) {
-    return accountDeletionCheckoutRedirect(request);
-  }
-  const team = await checkoutTeamCustomer(user);
-  const teamId = team.id;
-  if (!teamId) {
-    throw new Error("Stack team checkout customer is missing an id");
-  }
-
-  const successUrl =
-    `${request.nextUrl.origin}/api/billing/complete` +
-    `?session_id={CHECKOUT_SESSION_ID}&cmux_scheme=${encodeURIComponent(callbackScheme)}`;
-  const cancelUrl = new URL("/pricing?billing=cancelled", request.nextUrl.origin);
-  cancelUrl.searchParams.set("interval", interval);
-  const metadata = {
-    stackTeamId: teamId,
-    plan: "team",
-    app: "cmux",
-    billingInterval: interval,
-    nativeCallbackScheme: callbackScheme,
-  };
-
+  let teamId: string | undefined;
   try {
-    const customerId = await stripeCustomerForTeam(team, user.id);
+    const user =
+      (await stackServerApp.getUser({ or: "return-null" })) ??
+      (await stackServerApp.getUser({ or: "anonymous" }));
+    if (isAccountDeletionInProgress(user)) {
+      return accountDeletionCheckoutRedirect(request);
+    }
+    const stackUserId = checkoutPrincipalId(user.id, "user");
+    const team = await checkoutTeamCustomer(user);
+    const resolvedTeamId = checkoutPrincipalId(team.id, "team");
+    teamId = resolvedTeamId;
+
+    const successUrl =
+      `${request.nextUrl.origin}/api/billing/complete` +
+      `?session_id={CHECKOUT_SESSION_ID}&cmux_scheme=${encodeURIComponent(callbackScheme)}`;
+    const cancelUrl = new URL("/pricing?billing=cancelled", request.nextUrl.origin);
+    cancelUrl.searchParams.set("interval", interval);
+    const metadata = {
+      stackTeamId: resolvedTeamId,
+      plan: "team",
+      app: "cmux",
+      billingInterval: interval,
+      nativeCallbackScheme: callbackScheme,
+    };
+
+    const customerId = await stripeCustomerForTeam(team, stackUserId);
     const session = await stripe().checkout.sessions.create({
       mode: "subscription",
       line_items: [
@@ -235,14 +246,22 @@ async function stripeTeamCheckout(
         },
       ],
       customer: customerId,
-      client_reference_id: teamId,
+      client_reference_id: resolvedTeamId,
       metadata,
       subscription_data: { metadata },
       allow_promotion_codes: true,
       success_url: successUrl,
       cancel_url: cancelUrl.toString(),
     });
-    if (!session.url) throw new Error("Stripe Checkout Session did not include a URL");
+    if (!usableCheckoutSession(session)) {
+      throw new Error("Stripe Checkout Session did not include an id and URL");
+    }
+    deferCheckoutAnalytics(() => captureBillingCheckoutStarted({
+      sessionId: session.id,
+      subject: { scope: "team", stackTeamId: resolvedTeamId },
+      plan: "team",
+      billingInterval: interval,
+    }));
     return NextResponse.redirect(session.url);
   } catch (error) {
     captureBillingError(error, {
@@ -259,6 +278,36 @@ function accountDeletionCheckoutRedirect(request: NextRequest) {
   return NextResponse.redirect(
     new URL("/pricing?billing=account_deletion_in_progress", request.url),
   );
+}
+
+function checkoutPrincipalId(value: unknown, kind: "user" | "team"): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`Stack ${kind} checkout principal is missing an id`);
+  }
+  return value;
+}
+
+function usableCheckoutSession(
+  value: unknown,
+): value is { readonly id: string; readonly url: string } {
+  if (!value || typeof value !== "object") return false;
+  const session = value as { readonly id?: unknown; readonly url?: unknown };
+  return (
+    typeof session.id === "string" &&
+    session.id.trim().length > 0 &&
+    typeof session.url === "string" &&
+    session.url.trim().length > 0
+  );
+}
+
+function deferCheckoutAnalytics(task: () => Promise<void>): void {
+  try {
+    after(task);
+  } catch {
+    // Unit tests and non-Next callers have no request work store. Analytics is
+    // best effort and must never turn a valid Checkout session into an error.
+    void task();
+  }
 }
 
 function isAccountDeletionInProgress(user: { readonly clientReadOnlyMetadata?: unknown }): boolean {

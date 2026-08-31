@@ -16,9 +16,11 @@ import UniformTypeIdentifiers
 import CmuxTerminal
 
 /// The process entry point. When the binary is launched with a worker flag
-/// (the app re-executes its own binary that way so a crash in the Simulator,
-/// interpreter, or renderer kills only the worker process), run that worker
-/// loop instead of the app:
+/// (the app re-executes its own binary so a crash or hang in paste preparation,
+/// the Simulator, interpreter, or renderer kills only the worker process), run
+/// that worker instead of the app:
+/// - the paste worker resolves providers and prepares images before any app or
+///   SwiftUI startup;
 /// - the Simulator worker owns private frameworks and remote display state;
 /// - the render worker hosts its own faceless AppKit session and shares the
 ///   rendered layer tree with the host;
@@ -27,6 +29,7 @@ import CmuxTerminal
 @main
 enum CmuxMain {
     static func main() {
+        AppHostProcessReceipt.writeIfRequired()
 #if DEBUG
         // Bonsplit's `dlog` and the app's `cmuxDebugLog` resolve the same
         // debug log file. Route bonsplit through the shared writer so the
@@ -47,6 +50,9 @@ struct cmuxApp: App {
     /// `.settingsRuntime(_:)`; descendant views resolve their settings
     /// through it via the `@LiveSetting` property wrapper.
     private let settingsRuntime: SettingsRuntime
+
+    /// Single owner of the independently launched Computer Use helper daemon.
+    private let computerUseRuntimeService: ComputerUseRuntimeService
 
     /// The de-singletonized auth graph (shared AuthCoordinator + the macOS
     /// hosted-browser sign-in flow). Constructed once at app launch and
@@ -158,6 +164,47 @@ struct cmuxApp: App {
 
         Self.configureGhosttyEnvironment()
         StartupBreadcrumbLog.append("app.init.ghosttyEnvironment.configured")
+        let computerUsePaths = ComputerUseRuntimePaths()
+        setenv(
+            ComputerUseRuntimePaths.daemonSocketEnvironmentKey,
+            computerUsePaths.daemonSocketURL.path,
+            1
+        )
+        setenv(
+            ComputerUseRuntimePaths.codexDaemonSocketEnvironmentKey,
+            computerUsePaths.codexDaemonSocketURL.path,
+            1
+        )
+        setenv(
+            ComputerUseRuntimePaths.stateDirectoryEnvironmentKey,
+            computerUsePaths.stateDirectoryURL.path,
+            1
+        )
+        setenv(
+            ComputerUseRuntimePaths.runtimeScopeEnvironmentKey,
+            computerUsePaths.scope,
+            1
+        )
+        // Codex app approval authenticates the MCP broker as the exact
+        // executable already serving this cmux-owned helper generation.
+        // Export the installed helper path rather than the separately signed
+        // Resources/bin client; the wrapper validates the path before use.
+        setenv(
+            ComputerUseRuntimePaths.clientExecutableEnvironmentKey,
+            computerUsePaths.installedHelperExecutableURL.path,
+            1
+        )
+        // The helper bearer token is written to a private per-user runtime file
+        // and read only by the agent wrappers. Never place the capability in the
+        // app environment inherited by every terminal child.
+        unsetenv(ComputerUseRuntimePaths.authenticationTokenEnvironmentKey)
+        setenv(
+            ComputerUseRuntimePaths.authenticationTokenFileEnvironmentKey,
+            computerUsePaths.authenticationTokenFileURL.path,
+            1
+        )
+        let computerUseRuntimeService = ComputerUseRuntimeService(paths: computerUsePaths)
+        self.computerUseRuntimeService = computerUseRuntimeService
         _ = KeyboardShortcutSettings.settingsFileStore
         StartupBreadcrumbLog.append("app.init.keyboardShortcuts.loaded")
 
@@ -174,7 +221,10 @@ struct cmuxApp: App {
             secretStore: secretStore,
             errorLog: SettingsErrorLog(),
             accountFlow: authComposition.accountFlow,
-            hostActions: HostSettingsActions(configFileURL: configFileURL)
+            hostActions: HostSettingsActions(
+                configFileURL: configFileURL,
+                computerUseRuntimeService: computerUseRuntimeService
+            )
         )
         StartupBreadcrumbLog.append("app.init.settingsRuntime.created")
 
@@ -234,7 +284,8 @@ struct cmuxApp: App {
             notificationStore: notificationStore,
             sidebarState: sidebarState,
             settingsRuntime: settingsRuntime,
-            auth: authComposition
+            auth: authComposition,
+            computerUseRuntimeService: computerUseRuntimeService
         )
         StartupBreadcrumbLog.append("app.init.delegate.configured")
     }
@@ -427,6 +478,14 @@ struct cmuxApp: App {
                 Button(String(localized: "menu.app.makeDefaultTerminal", defaultValue: "Make cmux the Default Terminal")) {
                     DefaultTerminalUserAction.setAsDefault(debugSource: "menu.makeDefaultTerminal")
                 }
+                Divider()
+                Toggle(
+                    String(localized: "menu.app.keepMacAwake", defaultValue: "Keep Mac Awake"),
+                    isOn: Binding(
+                        get: { appDelegate.caffeineController.isEnabled },
+                        set: { appDelegate.caffeineController.setEnabled($0) }
+                    )
+                )
             }
 
             CommandGroup(replacing: .appInfo) {
@@ -504,12 +563,18 @@ struct cmuxApp: App {
                 }
                 .disabled(activeTabManager.selectedWorkspace == nil)
 
-                Button(String(localized: "menu.notifications.markAllRead", defaultValue: "Mark All Read")) {
+                splitCommandButton(
+                    title: String(localized: "menu.notifications.markAllRead", defaultValue: "Mark All Read"),
+                    shortcut: menuShortcut(for: .markAllNotificationsRead)
+                ) {
                     notificationStore.markAllRead()
                 }
                 .disabled(!snapshot.hasUnreadNotifications)
 
-                Button(String(localized: "menu.notifications.clearAll", defaultValue: "Clear All")) {
+                splitCommandButton(
+                    title: String(localized: "menu.notifications.clearAll", defaultValue: "Clear All"),
+                    shortcut: menuShortcut(for: .clearAllNotifications)
+                ) {
                     notificationStore.clearAll()
                 }
                 .disabled(!snapshot.hasNotifications)
@@ -559,6 +624,9 @@ struct cmuxApp: App {
                     }
                     Button("Browser Import Hint Debug…") {
                         BrowserImportHintDebugWindowController.shared.show()
+                    }
+                    Button("Cloud Tree Style Gallery…") {
+                        CloudTreeStyleGalleryWindowController.shared.show()
                     }
                     Button(
                         String(
@@ -734,7 +802,7 @@ struct cmuxApp: App {
                             debugSource: "menu.newWorkspace"
                         )
                     } else {
-                        activeTabManager.addWorkspace()
+                        activeTabManager.addWorkspaceIfActive()
                     }
                 }
 
@@ -748,7 +816,7 @@ struct cmuxApp: App {
                         // Last-resort fallback for a missing AppDelegate; keep
                         // the browser-availability gate identical to the
                         // shared action path.
-                        activeTabManager.addWorkspace(initialSurface: .browser)
+                        activeTabManager.addWorkspaceIfActive(initialSurface: .browser)
                     }
                 }
 
@@ -833,9 +901,11 @@ struct cmuxApp: App {
 #if DEBUG
                         cmuxDebugLog("find.menu Cmd+F fired")
 #endif
-                        _ = AppDelegate.shared?.performFindShortcutInActiveMainWindow(
-                            preferredWindow: NSApp.keyWindow ?? NSApp.mainWindow
-                        )
+                        if !performFocusedBrowserAction(.startFind) {
+                            _ = AppDelegate.shared?.performFindShortcutInActiveMainWindow(
+                                preferredWindow: NSApp.keyWindow ?? NSApp.mainWindow
+                            )
+                        }
                     }
 
                     splitCommandButton(title: String(localized: "menu.find.findInDirectory", defaultValue: "Find in Directory…"), shortcut: menuShortcut(for: .findInDirectory)) {
@@ -845,22 +915,28 @@ struct cmuxApp: App {
                     }
 
                     splitCommandButton(title: String(localized: "menu.find.findNext", defaultValue: "Find Next"), shortcut: menuShortcut(for: .findNext)) {
-                        restoreFindTargetFocus()
-                        activeTabManager.findNext()
+                        if !performFocusedBrowserAction(.findNext) {
+                            restoreFindTargetFocus()
+                            activeTabManager.findNext()
+                        }
                     }
 
                     splitCommandButton(title: String(localized: "menu.find.findPrevious", defaultValue: "Find Previous"), shortcut: menuShortcut(for: .findPrevious)) {
-                        restoreFindTargetFocus()
-                        activeTabManager.findPrevious()
+                        if !performFocusedBrowserAction(.findPrevious) {
+                            restoreFindTargetFocus()
+                            activeTabManager.findPrevious()
+                        }
                     }
 
                     Divider()
 
                     splitCommandButton(title: String(localized: "menu.find.hideFindBar", defaultValue: "Hide Find Bar"), shortcut: menuShortcut(for: .hideFind)) {
-                        restoreFindTargetFocus()
-                        activeTabManager.hideFind()
+                        if !performFocusedBrowserAction(.hideFind) {
+                            restoreFindTargetFocus()
+                            activeTabManager.hideFind()
+                        }
                     }
-                    .disabled(!(activeTabManager.isFindVisible))
+                    .disabled(!activeFindIsVisible)
 
                     Divider()
 
@@ -940,55 +1016,70 @@ struct cmuxApp: App {
             Divider()
             surfaceNavigationCommandButtons()
             splitCommandButton(title: String(localized: "menu.view.back", defaultValue: "Back"), shortcut: menuShortcut(for: .browserBack)) {
-                activeTabManager.focusedBrowserPanel?.goBack()
+                _ = performFocusedBrowserAction(.back)
             }
 
             splitCommandButton(title: String(localized: "menu.view.forward", defaultValue: "Forward"), shortcut: menuShortcut(for: .browserForward)) {
-                activeTabManager.focusedBrowserPanel?.goForward()
+                _ = performFocusedBrowserAction(.forward)
             }
 
             splitCommandButton(title: String(localized: "menu.view.reloadPage", defaultValue: "Reload Page"), shortcut: menuShortcut(for: .browserReload)) {
-                activeTabManager.focusedBrowserPanel?.reload()
+                _ = performFocusedBrowserAction(.reload)
             }
 
             splitCommandButton(title: String(localized: "menu.view.toggleDevTools", defaultValue: "Toggle Developer Tools"), shortcut: menuShortcut(for: .toggleBrowserDeveloperTools)) {
-                let manager = activeTabManager
-                if !manager.toggleDeveloperToolsFocusedBrowser() {
+                if !performFocusedBrowserAction(.toggleDeveloperTools) {
                     NSSound.beep()
                 }
             }
             splitCommandButton(title: String(localized: "menu.view.showJSConsole", defaultValue: "Show JavaScript Console"), shortcut: menuShortcut(for: .showBrowserJavaScriptConsole)) {
-                let manager = activeTabManager
-                if !manager.showJavaScriptConsoleFocusedBrowser() {
+                if !performFocusedBrowserAction(.showJavaScriptConsole) {
                     NSSound.beep()
                 }
             }
             splitCommandButton(title: String(localized: "menu.view.toggleReactGrab", defaultValue: "Toggle React Grab"), shortcut: menuShortcut(for: .toggleReactGrab)) {
-                if !activeTabManager.toggleReactGrabFromCurrentFocus() {
+                if !performFocusedBrowserAction(.toggleReactGrab) {
                     NSSound.beep()
                 }
             }
             splitCommandButton(title: String(localized: "menu.view.toggleDesignMode", defaultValue: "Toggle Design Mode"), shortcut: menuShortcut(for: .toggleBrowserDesignMode)) {
-                guard let panel = activeTabManager.focusedBrowserPanel else { NSSound.beep(); return }
-                Task { @MainActor in _ = await panel.toggleDesignMode(reason: "viewMenu") }
+                if !performFocusedBrowserAction(
+                    .toggleDesignMode(reason: "viewMenu")
+                ) {
+                    NSSound.beep()
+                }
             }
             let browserFocusModeMenu = browserFocusModeMenuSnapshot
             Button(browserFocusModeMenu.title) {
-                if !activeTabManager.toggleBrowserFocusModeForFocusedBrowser(reason: "viewMenu") {
+                if !performFocusedBrowserAction(
+                    .toggleFocusMode(reason: "viewMenu")
+                ) {
                     NSSound.beep()
                 }
             }
             .disabled(!browserFocusModeMenu.canToggle)
             splitCommandButton(title: String(localized: "menu.view.zoomIn", defaultValue: "Zoom In"), shortcut: menuShortcut(for: .browserZoomIn)) {
-                _ = activeTabManager.zoomInFocusedBrowserOrTextFilePreview()
+                if activeBrowserActionTarget != nil {
+                    _ = performFocusedBrowserAction(.zoomIn)
+                } else {
+                    _ = activeTabManager.zoomInFocusedBrowserOrTextFilePreview()
+                }
             }
 
             splitCommandButton(title: String(localized: "menu.view.zoomOut", defaultValue: "Zoom Out"), shortcut: menuShortcut(for: .browserZoomOut)) {
-                _ = activeTabManager.zoomOutFocusedBrowserOrTextFilePreview()
+                if activeBrowserActionTarget != nil {
+                    _ = performFocusedBrowserAction(.zoomOut)
+                } else {
+                    _ = activeTabManager.zoomOutFocusedBrowserOrTextFilePreview()
+                }
             }
 
             splitCommandButton(title: String(localized: "menu.view.actualSize", defaultValue: "Actual Size"), shortcut: menuShortcut(for: .browserZoomReset)) {
-                _ = activeTabManager.resetZoomFocusedBrowserOrTextFilePreview()
+                if activeBrowserActionTarget != nil {
+                    _ = performFocusedBrowserAction(.resetZoom)
+                } else {
+                    _ = activeTabManager.resetZoomFocusedBrowserOrTextFilePreview()
+                }
             }
 
             Button(String(localized: "menu.view.clearBrowserHistory", defaultValue: "Clear Browser History")) {
@@ -1130,6 +1221,7 @@ struct cmuxApp: App {
     }
 
     private func bootstrapMainWindowScene() {
+        appDelegate.adoptInitialMainWindowBootstrapManager(tabManager)
         appDelegate.scheduleInitialMainWindowBootstrap(debugSource: "swiftUIBootstrap")
         appDelegate.installReloadConfigurationMenuItemAction()
         applyAppearance()
@@ -1146,13 +1238,40 @@ struct cmuxApp: App {
 
     private var browserFocusModeMenuSnapshot: (title: String, canToggle: Bool) {
         let _ = browserFocusModeMenuRevision
-        let panel = activeTabManager.focusedBrowserPanel
+        let panel = activeBrowserPanel
         return (
             title: panel?.isBrowserFocusModeActive == true
                 ? String(localized: "menu.view.exitBrowserFocusMode", defaultValue: "Exit Browser Focus Mode")
                 : String(localized: "menu.view.enterBrowserFocusMode", defaultValue: "Enter Browser Focus Mode"),
             canToggle: panel?.canToggleBrowserFocusMode == true
         )
+    }
+
+    private var activeBrowserActionTarget: BrowserActionTarget? {
+        appDelegate.focusedBrowserActionTarget(
+            preferredWindow: NSApp.keyWindow ?? NSApp.mainWindow
+        )
+    }
+
+    private var activeBrowserPanel: BrowserPanel? {
+        guard let target = activeBrowserActionTarget else { return nil }
+        return appDelegate.browserPanel(resolving: target)
+    }
+
+    @discardableResult
+    private func performFocusedBrowserAction(
+        _ action: BrowserAction
+    ) -> Bool {
+        guard let target = activeBrowserActionTarget else { return false }
+        return BrowserActionDispatcher(appDelegate: appDelegate)
+            .perform(action, on: target)
+    }
+
+    private var activeFindIsVisible: Bool {
+        if let activeBrowserPanel {
+            return activeBrowserPanel.searchState != nil
+        }
+        return activeTabManager.isFindVisible
     }
 
     var activeTabManager: TabManager {
@@ -1178,6 +1297,12 @@ struct cmuxApp: App {
     }
 
     private func performBrowserSplitFromMenu(direction: SplitDirection) {
+        if activeBrowserActionTarget != nil {
+            if !performFocusedBrowserAction(.split(direction)) {
+                NSSound.beep()
+            }
+            return
+        }
         if AppDelegate.shared?.performBrowserSplitShortcut(direction: direction) == true {
             return
         }
@@ -1389,6 +1514,12 @@ struct cmuxApp: App {
     }
 
     private func closeOtherTabsInFocusedPane() {
+        if let dock = appDelegate.focusedDockStoreForShortcut(
+            preferredWindow: NSApp.keyWindow ?? NSApp.mainWindow
+        ) {
+            _ = dock.performShortcutCommand(.closeOtherTabsInPane)
+            return
+        }
         activeTabManager.closeOtherTabsInFocusedPaneWithConfirmation()
     }
 
@@ -1445,6 +1576,7 @@ private let cmuxAuxiliaryWindowIdentifiers: Set<String> = [
     "cmux.browser-popup",
     "cmux.browserProfilePopoverDebug",
     "cmux.configEditor",
+    "cmux.computerUse.onboarding",
     "cmux.defaultTerminalRegistrationError",
     "cmux.feedButtonStyleDebug",
     "cmux.feedPreview",
@@ -1464,6 +1596,7 @@ private let cmuxAuxiliaryWindowIdentifiers: Set<String> = [
     "cmux.sidebarDebug",
     "cmux.menubarDebug",
     "cmux.spinnerGallery",
+    "cmux.cloudTreeStyleGallery",
     "cmux.backgroundDebug",
     "cmux.startupAppearanceDebug",
     "cmux.bonsplitTabBarDebug",
@@ -1483,9 +1616,10 @@ func cmuxWindowShouldOwnCloseShortcut(_ window: NSWindow?) -> Bool {
 
 private enum DebugWindowConfigSnapshot {
     static func copyCombinedToPasteboard(defaults: UserDefaults = .standard) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(combinedPayload(defaults: defaults), forType: .string)
+        GhosttyApp.terminalPasteboard.writeString(
+            combinedPayload(defaults: defaults),
+            to: .general
+        )
     }
 
     static func combinedPayload(defaults: UserDefaults = .standard) -> String {
@@ -1822,9 +1956,10 @@ private struct DebugWindowControlsView: View {
 
     private func copyBrowserDevToolsButtonConfig() {
         let payload = BrowserDevToolsButtonDebugSettings.copyPayload(defaults: .standard)
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(payload, forType: .string)
+        GhosttyApp.terminalPasteboard.writeString(
+            payload,
+            to: .general
+        )
     }
 }
 #endif
@@ -3515,9 +3650,10 @@ private struct SidebarDebugView: View {
         sidebarActiveTabIndicatorStyle=\(sidebarActiveTabIndicatorStyle)
         sidebarDevBuildBannerVisible=\(showSidebarDevBuildBanner)
         """
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(payload, forType: .string)
+        GhosttyApp.terminalPasteboard.writeString(
+            payload,
+            to: .general
+        )
     }
 
     private func applyPreset() {
@@ -3653,9 +3789,10 @@ private struct MenuBarExtraDebugView: View {
 
                     Button("Copy Config") {
                         let payload = MenuBarIconDebugSettings.copyPayload()
-                        let pasteboard = NSPasteboard.general
-                        pasteboard.clearContents()
-                        pasteboard.setString(payload, forType: .string)
+                        GhosttyApp.terminalPasteboard.writeString(
+                            payload,
+                            to: .general
+                        )
                     }
                 }
 
@@ -4808,9 +4945,10 @@ private struct BackgroundDebugView: View {
         bgGlassTintHex=\(bgGlassTintHex)
         bgGlassTintOpacity=\(String(format: "%.2f", bgGlassTintOpacity))
         """
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(payload, forType: .string)
+        GhosttyApp.terminalPasteboard.writeString(
+            payload,
+            to: .general
+        )
     }
 }
 
@@ -5108,9 +5246,10 @@ private struct StartupAppearanceDebugView: View {
 
     private func copySelectedConfig() {
         guard let config = selectedPreviewConfigText else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(config, forType: .string)
+        GhosttyApp.terminalPasteboard.writeString(
+            config,
+            to: .general
+        )
     }
 }
 

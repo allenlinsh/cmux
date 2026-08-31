@@ -53,7 +53,15 @@ final class CmuxDebugWindowsCoordinator {
 
     init(decorator: (any WindowDecorating)?) {
         self.decorator = decorator
-        self.aboutTitlebarCoordinator = DebugWindowsCoordinator(decorator: decorator)
+        self.aboutTitlebarCoordinator = DebugWindowsCoordinator(
+            decorator: decorator,
+            copyText: { text in
+                _ = GhosttyApp.terminalPasteboard.writeString(
+                    text,
+                    to: .general
+                )
+            }
+        )
     }
 
     var aboutTitlebarStore: AboutTitlebarDebugStore {
@@ -545,11 +553,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     var aboutTitlebarDebugStore: AboutTitlebarDebugStore { debugWindowsCoordinator.aboutTitlebarStore }
     /// Coordinates remote tmux (`ssh … tmux -CC`) mirroring; composition-root owned.
     let remoteTmuxController = RemoteTmuxController()
+    /// Owns the process-scoped idle-sleep assertion shared by every local and
+    /// mobile entrypoint.
+    let caffeineController = CaffeineController()
     /// Composition-root lifetime owner shared by every window's font-size
     /// queue. Window coordinators receive this dependency explicitly; no
     /// coordinator reaches back through `AppDelegate.shared`.
     let workspaceTerminalFontSizeArbiter =
         WorkspaceTerminalFontSizeArbiter()
+    /// Owns the one process-local Vault drag capability registry.
+    let sessionDragRegistry = SessionDragRegistry()
+    /// Owns pane-transfer capabilities shared by every window, workspace, and Dock.
+    private var tabDragTransferRegistryStorage: TabDragTransferRegistry?
+    var tabDragTransferRegistry: TabDragTransferRegistry {
+        if let tabDragTransferRegistryStorage {
+            return tabDragTransferRegistryStorage
+        }
+        let registry = TabDragTransferRegistry()
+        tabDragTransferRegistryStorage = registry
+        return registry
+    }
+    /// Caches live pane-transfer resolution for pointer hit-testing paths.
+    lazy var liveTabDragCapabilityResolver = LiveTabDragCapabilityResolver(
+        registryProvider: { [weak self] in self?.tabDragTransferRegistry }
+    )
     private let systemAppearanceObserver = SystemAppearanceObserver()
     private static let reloadConfigurationMenuItemIdentifier = NSUserInterfaceItemIdentifier("com.cmux.reloadConfiguration")
     private static let cachedIsRunningUnderXCTest = MacSentryStartupPolicy.isRunningUnderXCTest(
@@ -690,10 +717,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             // so its `#if DEBUG` `jumpUnreadInvoked` recorder and nil-store guard
             // still fire exactly as before; map the resolved notification back to
             // its id for the package boundary.
-            focusedJump: { [unowned self] excludedNotificationId, excludedWorkspaceId in
+            focusedJump: {
+                [unowned self] excludedNotificationId, excludedWorkspaceId, excludedWindowDockTarget in
                 self.jumpToLatestUnread(
                     excludingNotificationId: excludedNotificationId,
-                    excludingWorkspaceId: excludedWorkspaceId
+                    excludingWorkspaceId: excludedWorkspaceId,
+                    excludingWindowDockTarget: excludedWindowDockTarget
                 )?.id
             }
         )
@@ -705,13 +734,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     lazy var notificationDeliverySeams = NotificationDeliverySeamAdapter(owner: self)
 
     lazy var notificationDelivery = NotificationDeliveryCoordinator(
-        center: UNUserNotificationCenter.current(),
+        center: TerminalNotificationStore.shared.userNotificationCenter,
         terminalNavigation: notificationNavigation,
+        terminalReplying: notificationDeliverySeams,
         feedReplying: notificationDeliverySeams,
         applicationActivation: notificationDeliverySeams,
         terminalIdentifiers: TerminalNotificationDeliveryIdentifiers(
             categoryIdentifier: TerminalNotificationStore.categoryIdentifier,
+            textReplyCategoryIdentifier: TerminalNotificationStore.textReplyCategoryIdentifier,
             showActionIdentifier: TerminalNotificationStore.actionShowIdentifier,
+            replyActionIdentifier: TerminalNotificationStore.actionReplyIdentifier,
             retargetsToLiveSurfaceOwnerUserInfoKey: TerminalNotificationStore.retargetsToLiveSurfaceOwnerUserInfoKey
         ),
         actionTitles: notificationDeliveryActionTitles
@@ -722,6 +754,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             show: String(
                 localized: "terminal.notification.action.show",
                 defaultValue: "Show"
+            ),
+            reply: String(
+                localized: "terminal.notification.action.reply",
+                defaultValue: "Reply"
+            ),
+            replySend: String(
+                localized: "terminal.notification.action.replySend",
+                defaultValue: "Send"
+            ),
+            replyPlaceholder: String(
+                localized: "terminal.notification.action.replyPlaceholder",
+                defaultValue: "Message the agent…"
             ),
             feedPermissionAllowOnce: String(
                 localized: "feed.notification.permission.allowOnce",
@@ -751,9 +795,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 localized: "feed.notification.exitPlan.autoAccept",
                 defaultValue: "Auto"
             ),
+            feedExitPlanRevise: String(
+                localized: "feed.notification.exitPlan.revise",
+                defaultValue: "Revise…"
+            ),
             feedQuestionReply: String(
                 localized: "feed.notification.question.reply",
                 defaultValue: "Reply"
+            ),
+            feedQuestionOther: String(
+                localized: "feed.notification.question.other",
+                defaultValue: "Other…"
             )
         )
     }
@@ -781,6 +833,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// `ContentView` environment so `@LiveSetting` can resolve the stores it
     /// observes inside the sidebar.
     var settingsRuntime: SettingsRuntime?
+    private var computerUseRuntimeService: ComputerUseRuntimeService?
     weak var fileExplorerState: FileExplorerState?
     weak var fullscreenControlsViewModel: TitlebarControlsViewModel?
     weak var sidebarSelectionState: SidebarSelectionState?
@@ -797,6 +850,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var shortcutDefaultsObserver: NSObjectProtocol?
     private var menuBarVisibilityObserver: NSObjectProtocol?
     private var mobileHostSettingsObserver: NSObjectProtocol?
+    /// Applies MDM managed-policy transitions (browser/remote-control) while
+    /// the app runs. Installed once from `installManagedPolicyEnforcement()`.
+    var managedPolicyEnforcementObserver: ManagedPolicyEnforcementObserver?
     private var reloadConfigurationMenuItemRefreshScheduled = false
     /// Orchestrates per-window cmux config-store reloads + window-title refresh.
     /// Holds `self` weakly through the environment seam to avoid a retain cycle.
@@ -811,6 +867,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var splitButtonTooltipRefreshScheduled = false
     private var didScheduleGhosttyCrashBreadcrumbCheck = false
     private var ghosttyCrashBreadcrumbTask: Task<Void, Never>?
+    /// Shared result for the one crash-artifact scan used by both the
+    /// diagnostic notification and the rare missing-primary recovery probe.
+    private var pendingCrashScanTask: Task<GhosttyCrashBreadcrumb.PendingCrash?, Never>?
+    private var isWaitingForStartupCrashRecoveryProbe = false
+    private var deferredInitialMainWindowBootstrapDebugSource: String?
     struct PendingConfiguredShortcutChord {
         let firstStroke: ShortcutStroke
         let windowNumber: Int?
@@ -876,6 +937,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var menuBarExtraController: MenuBarExtraController?
     private var transientGlobalSearchMenuBarExtraController: MenuBarExtraController?
     private var lastMenuBarExtraShouldInstall: Bool?
+    /// App-owned computer-use graph; all runtime dependencies are injected here.
+    private lazy var computerUseUXCoordinator: ComputerUseUXCoordinator = {
+        guard let computerUseRuntimeService else {
+            preconditionFailure("ComputerUseRuntimeService must be injected before coordinator use")
+        }
+        let catalog = settingsRuntime?.catalog ?? SettingCatalog()
+        let configStore = settingsRuntime?.jsonStore
+            ?? JSONConfigStore(fileURL: CmuxConfigLocation().userConfigFile)
+        return ComputerUseUXCoordinator(
+            liveAgentIndex: SharedLiveAgentIndex.shared,
+            stateRepository: ComputerUseStateRepository(
+                authenticationKey: computerUseRuntimeService.stateAuthenticationKey
+            ),
+            stateDirectoryURL: computerUseRuntimeService.stateDirectoryURL,
+            configStore: configStore,
+            enabledKey: catalog.computerUse.enabled,
+            showInMenuBarKey: catalog.computerUse.showInMenuBar,
+            liveSettingRepository: ComputerUseLiveSettingRepository(
+                fileURL: TerminalSurface.computerUseLiveSettingFileURL(
+                    homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+                )
+            ),
+            runtimeService: computerUseRuntimeService,
+            userDefaults: .standard,
+            workspaceTitle: { [weak self] workspaceID in
+                self?.tabTitle(for: workspaceID)
+            },
+            featureEnabled: {
+                CmuxFeatureFlags.shared.isComputerUseUXEnabled
+            }
+        )
+    }()
     private lazy var mainWindowVisibilityController = MainWindowVisibilityController(
         dependencies: .init(
             isActivationSuppressed: {
@@ -1035,6 +1128,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #endif
 
     var mainWindowContexts: [ObjectIdentifier: MainWindowContext] = [:]
+    /// Per-app recoverable routing state; owned explicitly so test app delegates
+    /// and concurrent tagged instances never share ambient lifecycle state.
+    let mainWindowRouteLedger = MainWindowRouteLedger()
     private var mainWindowControllers: [MainWindowController] = []
 
     /// Tracks the cascade point for new windows, matching Ghostty's upstream algorithm.
@@ -1042,6 +1138,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var lastCascadePoint = NSPoint.zero
     private(set) var startupSessionSnapshot: AppSessionSnapshot?
     private var didPrepareStartupSessionSnapshot = false
+    /// Classification of the process that preceded this launch. Captured before
+    /// the current run arms its sentinel so a crash can recover a missing primary
+    /// snapshot from the immutable `-previous` copy.
+    private var previousSessionLaunchWasUnclean = false
+    private var didCaptureSessionLaunchState = false
+    private var didArmSessionLaunchSentinel = false
     var didAttemptStartupSessionRestore = false
     var isApplyingSessionRestore = false
     /// Durable navigation links that arrived before startup restore registered
@@ -1097,6 +1199,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var didReplyToTerminate = false
     // True while owned asynchronous cleanup controls the terminate reply.
     private var isAwaitingTerminateCleanup = false
+    enum TerminateCleanupPhase: Equatable, Sendable {
+        case ownedRuntimeCleanup
+        case freshSnapshot
+    }
+    enum TerminateCleanupDeadlineDisposition: Equatable, Sendable {
+        case persistCachedSnapshotAndTerminate
+        case cancelTerminationAfterRuntimeCleanupFailure
+    }
+    private var terminateCleanupPhase: TerminateCleanupPhase?
     private var terminateOwnedCleanupTask: Task<Void, Never>?
     private var terminateCleanupWatchdogTask: Task<Void, Never>?
     /// Force-exits if AppKit's terminate gauntlet wedges (#6758).
@@ -1233,12 +1344,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 )
             }
         )
-        super.init(); Self.shared = self
+        super.init()
+        // Capture the prior process before composition-root wiring begins. The
+        // later configure/didFinish hooks remain idempotent fallbacks for
+        // delegate lifecycles that bypass the normal SwiftUI path.
+        captureSessionLaunchStateIfNeeded()
+        Self.shared = self
         mainThreadHangWatchdog.start()
         AgentChatThemeSync.start()
         // Inverts the surface registry's legacy AppDelegate.shared reach-up:
         // the registry asks this delegate (via MainWindowRouteRetiring) to
-        // sweep recoverable main-window routes after a surface unregisters.
+        // audit recoverable route lifecycle after a surface unregisters.
         GhosttyApp.terminalSurfaceRegistry.attachRouteRetirer(self)
     }
 
@@ -1335,6 +1451,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Composition root for surfaces: this Mac's panes and every cloud machine's
+        // cmux-tui session feed one catalog, and the sidebar, drag/drop, socket and CLI all
+        // open through `SurfaceCatalog.project`.
+        SurfaceCatalog.shared.register(LocalSurfaceProvider.shared)
+        SurfaceCatalog.shared.focusProjection = { projection in
+            SurfacePaneFactory.focus(panelID: projection.panelID, in: projection.workspaceID)
+        }
+        CmuxTuiSurfaceProviderRegistry.shared.start(catalog: .shared)
         let env = ProcessInfo.processInfo.environment
         let telemetryEnabled = TelemetrySettings.enabledForCurrentLaunch
         let sentryStartupPolicy = MacSentryStartupPolicy(
@@ -1564,6 +1688,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NSApp.servicesProvider = self
 
         StartupBreadcrumbLog.append("appDelegate.didFinish.bootstrap.begin")
+        // Cover delegate lifecycles where SwiftUI has not called configure yet;
+        // both methods are idempotent and the snapshot probe remains gated to
+        // the missing-primary case.
+        captureSessionLaunchStateIfNeeded(environment: env)
+        prepareStartupSessionSnapshotIfNeeded()
         scheduleInitialMainWindowBootstrap(debugSource: "didFinishLaunching")
         StartupBreadcrumbLog.append("appDelegate.didFinish.complete")
 #if DEBUG
@@ -1892,6 +2021,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if TelemetrySettings.enabledForCurrentLaunch && !isRunningUnderXCTestCached {
             PostHogAnalytics.shared.trackActive(reason: "didBecomeActive")
         }
+        // A Mac that slept through the reply nudge picks parked replies up here.
+        PhoneReplyInboxCoordinator.shared.sweepSoon(reason: "app-activation")
 
         guard let notificationStore else { return }
         notificationStore.handleApplicationDidBecomeActive()
@@ -1923,6 +2054,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         terminateCleanupWatchdogTask?.cancel()
         terminateCleanupWatchdogTask = nil
         terminateOwnedCleanupTask = nil
+        terminateCleanupPhase = nil
         // A cancelled quit ends this terminate request; the next quit must reply again.
         if !shouldTerminate {
             didReplyToTerminate = false
@@ -1930,17 +2062,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
-    private func deferTerminateForOwnedCleanup(reason: String) -> Bool {
+    private func deferTerminateForOwnedCleanupAndFreshSnapshot(reason: String) -> Bool {
         let markedForKill = remoteTmuxController.windowsMarkedForKillOnClose()
         let simulatorCleanupTasks = SimulatorPanel.beginApplicationTerminationCleanup()
-        guard !markedForKill.isEmpty || !simulatorCleanupTasks.isEmpty else { return false }
+        let hasOwnedRuntimeCleanup = !markedForKill.isEmpty || !simulatorCleanupTasks.isEmpty
         if !isAwaitingTerminateCleanup {
             isAwaitingTerminateCleanup = true
+            terminateCleanupPhase = .ownedRuntimeCleanup
             StartupBreadcrumbLog.append(
                 "appDelegate.shouldTerminate.cleanupLater",
                 fields: [
                     "windows": String(markedForKill.count),
                     "simulatorPanels": String(simulatorCleanupTasks.count),
+                    "freshAgentIndex": "1",
                     "reason": reason,
                 ]
             )
@@ -1961,6 +2095,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     self.cancelTerminationAfterSimulatorCleanupFailure()
                     return
                 }
+                self.terminateCleanupPhase = .freshSnapshot
+                let ttyDeviceBindings = self.currentSurfaceTTYDeviceBindings()
+                let resumeIndexes = await ProcessDetectedResumeIndexes.loadFresh(
+                    ttyDeviceBindings: ttyDeviceBindings
+                )
+                guard !Task.isCancelled else { return }
+                _ = self.saveSessionSnapshot(
+                    includeScrollback: true,
+                    removeWhenEmpty: false,
+                    restorableAgentIndex: resumeIndexes.restorableAgentIndex,
+                    surfaceResumeBindingIndex: resumeIndexes.surfaceResumeBindingIndex
+                )
+                ClosedItemHistoryStore.shared.flushPendingSaves()
                 self.terminationWatchdog.arm()
                 self.replyToTerminateOnce(true)
             }
@@ -1971,16 +2118,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             // watchdog requests cancellation after that contract plus cleanup
             // headroom. It cancels the actual panel and rollback tasks, joins
             // rollback only for a bounded grace period, then explicitly cancels
-            // this quit request. Durable records preserve any unfinished work.
-            let cleanupDeadline: Duration = simulatorCleanupTasks.isEmpty
-                ? .milliseconds(3_500)
-                : .seconds(150)
+            // this quit request. Once owned cleanup succeeds, the fresh agent-index
+            // load is the only remaining work; its timeout falls back to cached
+            // indexes and lets termination proceed without reporting cleanup failure.
+            let cleanupDeadline: Duration
+            if !simulatorCleanupTasks.isEmpty {
+                cleanupDeadline = .seconds(155)
+            } else if !markedForKill.isEmpty {
+                cleanupDeadline = .milliseconds(8_500)
+            } else {
+                cleanupDeadline = .seconds(5)
+            }
             terminateCleanupWatchdogTask?.cancel()
             terminateCleanupWatchdogTask = Task { @MainActor in
                 try? await ContinuousClock().sleep(for: cleanupDeadline)
                 guard !Task.isCancelled else { return }
-                SimulatorPanel.cancelApplicationTerminationCleanup()
                 cleanupTask.cancel()
+                let disposition = Self.terminateCleanupDeadlineDisposition(
+                    phase: self.terminateCleanupPhase,
+                    hasOwnedRuntimeCleanup: hasOwnedRuntimeCleanup
+                )
+                guard disposition == .cancelTerminationAfterRuntimeCleanupFailure else {
+                    _ = self.saveSessionSnapshotUsingCachedProcessDetectedIndexes(
+                        includeScrollback: true,
+                        removeWhenEmpty: false
+                    )
+                    ClosedItemHistoryStore.shared.flushPendingSaves()
+                    self.terminationWatchdog.arm()
+                    self.replyToTerminateOnce(true)
+                    return
+                }
+                SimulatorPanel.cancelApplicationTerminationCleanup()
                 let cleanupJoined = await TerminalController.shared
                     .simulatorCameraCleanupOwnershipScope
                     .cancelPendingCleanupAndWait(timeout: .seconds(5))
@@ -1992,6 +2160,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
         }
         return true
+    }
+
+    nonisolated static func terminateCleanupDeadlineDisposition(
+        phase: TerminateCleanupPhase?,
+        hasOwnedRuntimeCleanup: Bool
+    ) -> TerminateCleanupDeadlineDisposition {
+        if phase == .freshSnapshot || !hasOwnedRuntimeCleanup {
+            return .persistCachedSnapshotAndTerminate
+        }
+        return .cancelTerminationAfterRuntimeCleanupFailure
     }
 
     private func cancelTerminationAfterSimulatorCleanupFailure() {
@@ -2026,8 +2204,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func prepareForConfirmedAppTermination() {
         isTerminatingApp = true
-        _ = saveSessionSnapshotIncludingProcessDetectedIndexes(includeScrollback: true, removeWhenEmpty: false)
-        ClosedItemHistoryStore.shared.flushPendingSaves()
+        computerUseUXCoordinator.teardownForTermination()
+        // The terminate-later cleanup loads the authoritative agent index off-main and
+        // persists it immediately before replying to AppKit.
         // The hard AppKit watchdog is armed immediately before the terminate
         // reply, after any owned asynchronous cleanup has finished. This keeps
         // the will-terminate gauntlet bounded without cutting rollback short.
@@ -2063,7 +2242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             isQuitWarningConfirmed = true
             closeAllWebInspectorsBeforeAppTeardown()
             StartupBreadcrumbLog.append("appDelegate.shouldTerminate.reply", fields: ["shouldQuit": "1"])
-            if deferTerminateForOwnedCleanup(reason: "confirmedDialog") {
+            if deferTerminateForOwnedCleanupAndFreshSnapshot(reason: "confirmedDialog") {
                 return
             }
         } else {
@@ -2121,7 +2300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
             // Finish Simulator rollback and any explicitly marked remote-session
             // kills before AppKit begins synchronous process teardown.
-            if deferTerminateForOwnedCleanup(reason: reason) {
+            if deferTerminateForOwnedCleanupAndFreshSnapshot(reason: reason) {
                 return .terminateLater
             }
             terminationWatchdog.arm()
@@ -2149,12 +2328,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func applicationWillTerminate(_ notification: Notification) {
         StartupBreadcrumbLog.append("appDelegate.willTerminate.begin")
         // Backstop for any terminate path that did not route through
-        // prepareForConfirmedAppTermination() (idempotent with the primary arm).
+        // prepareForConfirmedAppTermination(). Normal confirmed termination has already
+        // persisted a fresh index before AppKit receives its reply; do not overwrite that
+        // snapshot with the stale-tolerant synchronous fallback here.
         // Apple's promised-pasteboard observer can fire before this delegate
         // method, so the primary arm above is what bounds #6758; this only
         // widens coverage to other entrypoints.
+        let needsTerminationSnapshotBackstop = !isTerminatingApp
         isTerminatingApp = true
-        _ = saveSessionSnapshotIncludingProcessDetectedIndexes(includeScrollback: true, removeWhenEmpty: false)
+        computerUseUXCoordinator.teardownForTermination()
+        if needsTerminationSnapshotBackstop {
+            _ = saveSessionSnapshotIncludingProcessDetectedIndexes(includeScrollback: true, removeWhenEmpty: false)
+        }
         ClosedItemHistoryStore.shared.flushPendingSaves()
         terminationWatchdog.arm()
         sentryStopMemoryContextRefresh()
@@ -2168,18 +2353,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         stopSessionAutosaveTimer()
         CloudVMActionLauncher.shared.terminateAll()
         CmuxSSHURLProcessLauncher.shared.terminateAll()
+        caffeineController.setEnabled(false)
         MobileHostService.shared.stop()
-        TerminalController.shared.stop()
+        TerminalController.shared.stop(cleanupDiscoveryState: true)
         GhosttyApp.terminalPasteboard.cleanupAllOwnedTemporaryImageFiles()
         VSCodeServeWebController.shared.stop()
         BrowserProfileStore.shared.flushPendingSaves()
         ghosttyCrashBreadcrumbTask?.cancel()
         ghosttyCrashBreadcrumbTask = nil
+        pendingCrashScanTask?.cancel()
+        pendingCrashScanTask = nil
         notificationStore?.clearAll()
         GhosttyCrashBreadcrumb.markCleanExit()
         unregisterDisplayReconfigurationCallbackIfNeeded()
         StartupBreadcrumbLog.append("appDelegate.willTerminate.complete")
         enableSuddenTerminationIfNeeded()
+        // Remove the unclean-launch sentinel only after the full termination
+        // tail has completed; a teardown crash must remain recoverable next run.
+        if didArmSessionLaunchSentinel {
+            GhosttyCrashBreadcrumb.markSessionCleanExit()
+        }
     }
 
     func applicationWillResignActive(_ notification: Notification) {
@@ -2193,7 +2386,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     func persistSessionForUpdateRelaunch() {
         isTerminatingApp = true
-        _ = saveSessionSnapshotIncludingProcessDetectedIndexes(includeScrollback: true, removeWhenEmpty: false)
+        _ = saveSessionSnapshotUsingCachedProcessDetectedIndexes(
+            includeScrollback: true,
+            removeWhenEmpty: false
+        )
         ClosedItemHistoryStore.shared.flushPendingSaves()
     }
 
@@ -2202,29 +2398,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         notificationStore: TerminalNotificationStore,
         sidebarState: SidebarState,
         settingsRuntime: SettingsRuntime,
-        auth: MacAuthComposition
+        auth: MacAuthComposition,
+        computerUseRuntimeService: ComputerUseRuntimeService
     ) {
+        captureSessionLaunchStateIfNeeded()
         self.tabManager = tabManager
+        if let tabDragTransferRegistryStorage {
+            precondition(
+                tabDragTransferRegistryStorage === tabManager.tabDragTransferRegistry,
+                "AppDelegate pane-transfer registry must match the initial TabManager"
+            )
+        }
+        tabDragTransferRegistryStorage = tabManager.tabDragTransferRegistry
         // SwiftUI constructs the initial TabManager before this delegate is
-        // available; adopt its coordinator so every later window shares it.
+        // available; adopt its coordinators so every later window shares them.
         pullRequestProbeService = tabManager.pullRequestProbeService
         self.settingsRuntime = settingsRuntime
         self.notificationStore = notificationStore
         self.sidebarState = sidebarState
         self.auth = auth
+        self.computerUseRuntimeService = computerUseRuntimeService
+        (settingsRuntime.hostActions as? HostSettingsActions)?.setRunComputerUseOnboardingAction { [weak self] startingPoint in
+            self?.computerUseUXCoordinator.presentOnboarding(startingAt: startingPoint)
+        }
         VMClient.bootstrap(auth: auth.coordinator)
         RemotesClient.bootstrap(auth: auth.coordinator)
         AIAccountsClient.bootstrap(auth: auth.coordinator)
         PhonePushClient.shared.configure(auth: auth.coordinator)
         MobileHostService.shared.configure(auth: auth.coordinator)
+        caffeineController.onStateChange = { [weak self] enabled in
+            self?.menuBarExtraController?.refreshForDebugControls()
+            MobileHostService.emitEvent(
+                topic: "caffeine.status.changed",
+                payload: ["enabled": enabled]
+            )
+        }
         DeviceRegistryClient.shared.configure(auth: auth.coordinator)
         PresenceHeartbeatClient.shared.configure(auth: auth.coordinator)
+        PhoneReplyInboxClient.shared.configure(auth: auth.coordinator)
+        PhoneReplyInboxCoordinator.shared.configure(client: PhoneReplyInboxClient.shared)
+        // Relayed phone replies type through the SAME entrypoint as the phone's
+        // direct RPC sends, so both lanes share claim resolution and injection.
+        PhoneReplyInboxCoordinator.shared.injectTerminalInput = { params in
+            switch TerminalController.shared.v2MobileTerminalInput(params: params) {
+            case .ok:
+                return .delivered
+            case .err(let code, _, _):
+                // `not_found` is transient here, not proof the target is gone:
+                // the sweep can run while session restore is still loading the
+                // claimed workspace. Retrying is bounded by the reply's
+                // server-side TTL, so a truly-deleted surface ages out instead
+                // of silently discarding the user's reply on first sight.
+                return code == "input_queue_full"
+                    || code == "surface_unavailable"
+                    || code == "not_found"
+                    ? .retryable
+                    : .permanentlyUndeliverable
+            }
+        }
         connectivityInvalidationSubscriberCoordinator.configure(auth: auth.coordinator)
         // DEV-only: auto-publish this Mac's attach route to the signed-in user's
         // pairedMacs backup so a fresh dev iOS build restores it (no manual host
         // entry). No-op on Release / when the flag is off.
         MacPairedMacBackupPublisher.shared.configure(auth: auth.coordinator)
         TerminalController.shared.attachAuth(coordinator: auth.coordinator, accountFlow: auth.accountFlow)
+        TerminalController.shared.attachCaffeineController(caffeineController)
         TerminalController.shared.agentChatTranscriptService = agentChatTranscriptService
         if !isRunningUnderXCTest(ProcessInfo.processInfo.environment) {
             TerminalController.shared.startSimulatorMutationRecovery()
@@ -2234,6 +2472,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         MobileTerminalRenderObserver.shared.start()
         agentChatTranscriptService.start()
         installMobileHostSettingsObserver()
+        installManagedPolicyEnforcement()
         scheduleGhosttyCrashBreadcrumbIfNeeded(notificationStore: notificationStore)
         startPaneMemoryGuardrailIfNeeded()
         disableSuddenTerminationIfNeeded()
@@ -2266,13 +2505,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #endif
     }
 
+    private func pendingCrashScanTaskIfNeeded() -> Task<GhosttyCrashBreadcrumb.PendingCrash?, Never> {
+        if let pendingCrashScanTask {
+            return pendingCrashScanTask
+        }
+        let task = Task {
+            await GhosttyCrashBreadcrumb.pendingCrashFromDefaultStorage()
+        }
+        pendingCrashScanTask = task
+        return task
+    }
+
     private func scheduleGhosttyCrashBreadcrumbIfNeeded(notificationStore: TerminalNotificationStore) {
         guard !didScheduleGhosttyCrashBreadcrumbCheck else { return }
         didScheduleGhosttyCrashBreadcrumbCheck = true
+        let pendingCrashScanTask = pendingCrashScanTaskIfNeeded()
 
-        ghosttyCrashBreadcrumbTask = Task { [weak self, weak notificationStore] in
+        ghosttyCrashBreadcrumbTask = Task { @MainActor [weak self, weak notificationStore] in
             defer { self?.ghosttyCrashBreadcrumbTask = nil }
-            guard let pendingCrash = await GhosttyCrashBreadcrumb.pendingCrashFromDefaultStorage(),
+            guard let pendingCrash = await pendingCrashScanTask.value,
                   !Task.isCancelled,
                   let notificationStore else { return }
             notificationStore.addNotification(
@@ -3348,14 +3599,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 #endif
 
+    private func captureSessionLaunchStateIfNeeded(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        guard !didCaptureSessionLaunchState else { return }
+        didCaptureSessionLaunchState = true
+        // Test processes must not leave a production lifecycle sentinel behind;
+        // this also keeps isolated unit-test app delegates from affecting the
+        // user's next launch.
+        guard !isRunningUnderXCTest(environment), !isRunningUnderXCTestCached else { return }
+        previousSessionLaunchWasUnclean = GhosttyCrashBreadcrumb.captureSessionLaunchState(
+            environment: environment
+        )
+        didArmSessionLaunchSentinel = true
+#if DEBUG
+        cmuxDebugLog(
+            "session.launchState previousUnclean=\(previousSessionLaunchWasUnclean ? 1 : 0)"
+        )
+#endif
+    }
+
     private func prepareStartupSessionSnapshotIfNeeded() {
         guard !didPrepareStartupSessionSnapshot else { return }
         didPrepareStartupSessionSnapshot = true
         Self.removeLegacyPersistedWindowGeometry()
-        syncManualRestoreSnapshotCachePruningCrashDiagnostics()
+        if shouldAwaitCrashRecoveryProbe() {
+            isWaitingForStartupCrashRecoveryProbe = true
+            let pendingCrashScanTask = pendingCrashScanTaskIfNeeded()
+            Task { @MainActor [weak self] in
+                let pendingCrash = await pendingCrashScanTask.value
+                guard let self, !Task.isCancelled, !self.isTerminatingApp else { return }
+                if pendingCrash != nil {
+                    self.previousSessionLaunchWasUnclean = true
+                }
+#if DEBUG
+                cmuxDebugLog(
+                    "session.restore.crashProbe pending=\(pendingCrash != nil ? 1 : 0)"
+                )
+#endif
+                self.isWaitingForStartupCrashRecoveryProbe = false
+                self.finishPreparingStartupSessionSnapshot()
+                self.resumeDeferredInitialMainWindowBootstrapIfNeeded()
+            }
+            return
+        }
+        finishPreparingStartupSessionSnapshot()
+    }
+
+    /// A missing primary with a backup is ambiguous until the asynchronous
+    /// crash-artifact probe completes. Defer cleanup and window bootstrap only
+    /// for that rare case; normal launches never wait on crash-file I/O.
+    private func shouldAwaitCrashRecoveryProbe() -> Bool {
+        guard SessionRestorePolicy.shouldAttemptRestore(),
+              !didHandleExplicitOpenIntentAtStartup,
+              !isRunningUnderXCTest(ProcessInfo.processInfo.environment),
+              !previousSessionLaunchWasUnclean,
+              !Self.hasCrashOnlyPrimarySnapshotRemovalMarker(),
+              let primaryURL = sessionSnapshotStore.defaultSnapshotFileURL(),
+              let backupURL = sessionSnapshotStore.manualRestoreSnapshotFileURL() else {
+            return false
+        }
+        return !FileManager.default.fileExists(atPath: primaryURL.path)
+            && FileManager.default.fileExists(atPath: backupURL.path)
+    }
+
+    private func finishPreparingStartupSessionSnapshot() {
+        syncManualRestoreSnapshotCachePruningCrashDiagnostics(
+            preserveExistingBackup: previousSessionLaunchWasUnclean
+        )
         let sanitizedStartupSnapshot = loadStartupSessionSnapshotPruningCrashDiagnostics()
-        guard SessionRestorePolicy.shouldAttemptRestore() else { return }
+        guard SessionRestorePolicy.shouldAttemptRestore(),
+              !didHandleExplicitOpenIntentAtStartup else { return }
         startupSessionSnapshot = sanitizedStartupSnapshot
+    }
+
+    private func resumeDeferredInitialMainWindowBootstrapIfNeeded() {
+        guard !didHandleExplicitOpenIntentAtStartup,
+              let debugSource = deferredInitialMainWindowBootstrapDebugSource else {
+            deferredInitialMainWindowBootstrapDebugSource = nil
+            return
+        }
+        deferredInitialMainWindowBootstrapDebugSource = nil
+        scheduleInitialMainWindowBootstrap(debugSource: debugSource)
     }
 
     private func loadStartupSessionSnapshotPruningCrashDiagnostics() -> AppSessionSnapshot? {
@@ -3369,7 +3694,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
             return loadManualRestoreSessionSnapshotPruningCrashDiagnostics()
         case .missing:
-            if Self.hasCrashOnlyPrimarySnapshotRemovalMarker() {
+            if Self.shouldRecoverMissingPrimarySessionSnapshot(
+                previousLaunchWasUnclean: previousSessionLaunchWasUnclean,
+                crashOnlyPrimarySnapshotRemovalMarker: Self.hasCrashOnlyPrimarySnapshotRemovalMarker()
+            ) {
                 return loadManualRestoreSessionSnapshotPruningCrashDiagnostics()
             }
             return nil
@@ -3478,6 +3806,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let didApplyStartupSessionRestore = attemptStartupSessionRestoreIfNeeded(
             primaryWindow: primaryWindow
         )
+        if !didApplyStartupSessionRestore, didAttemptStartupSessionRestore {
+            // No snapshot restore ran (fresh start / restore disabled):
+            // replay the agent journal now. When a restore DID run,
+            // completeSessionRestoreOperation triggers replay after the
+            // restored panel-identity aliases are recorded.
+            AgentJournalLifecycleCenter.shared.noteStartupReplayReady()
+        }
         if Self.shouldSaveSessionSnapshotAfterMainWindowRegistration(
             isTerminatingApp: isTerminatingApp,
             didApplyStartupSessionRestore: didApplyStartupSessionRestore,
@@ -3586,6 +3921,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func completeSessionRestoreOperation(isManualReopen: Bool) {
+        // Every restored workspace has enqueued its identity aliases by now;
+        // the journal consumer is FIFO, so the replay fold sees all of them.
+        AgentJournalLifecycleCenter.shared.noteStartupReplayReady()
         startupSessionSnapshot = nil
         let wasApplyingSessionRestore = isApplyingSessionRestore
         isApplyingSessionRestore = false
@@ -3682,8 +4020,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 "snapshotDisplay={\(debugSessionDisplayDescription(snapshot.display))}"
         )
 #endif
-        context.tabManager.restoreSessionSnapshot(snapshot.tabManager, workspaceCreateIdempotencyCache: TerminalController.shared.workspaceCreateIdempotencyCache)
-        context.restoreWindowDockSessionSnapshot(snapshot)
+        context.tabManager.restoreSessionSnapshot(
+            snapshot.tabManager,
+            deferBrowserPanels: true,
+            workspaceCreateIdempotencyCache: TerminalController.shared.workspaceCreateIdempotencyCache
+        )
+        context.restoreWindowDockSessionSnapshot(
+            snapshot,
+            notificationStore: notificationStore,
+            deferBrowserPanels: true
+        )
         // Seed restored per-config frames for later configuration switches.
         if let configFrames = snapshot.configFrames {
             windowConfigFrames[context.windowId] = SessionConfigFrameRing(entries: configFrames)
@@ -4004,7 +4350,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isTerminatingApp = true
-                _ = self.saveSessionSnapshotIncludingProcessDetectedIndexes(includeScrollback: true, removeWhenEmpty: false)
+                let ttyDeviceBindings = self.currentSurfaceTTYDeviceBindings()
+                let resumeIndexes = await ProcessDetectedResumeIndexes.loadFresh(
+                    ttyDeviceBindings: ttyDeviceBindings
+                )
+                _ = self.saveSessionSnapshot(
+                    includeScrollback: true,
+                    removeWhenEmpty: false,
+                    restorableAgentIndex: resumeIndexes.restorableAgentIndex,
+                    surfaceResumeBindingIndex: resumeIndexes.surfaceResumeBindingIndex
+                )
                 ClosedItemHistoryStore.shared.flushPendingSaves()
             }
         }
@@ -4102,7 +4457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         didDisableSuddenTermination = false
     }
 
-    private func sessionAutosaveFingerprint(
+    func sessionAutosaveFingerprint(
         includeScrollback: Bool,
         restorableAgentIndex: RestorableAgentSessionIndex,
         surfaceResumeBindingIndex: SurfaceResumeBindingIndex
@@ -4110,32 +4465,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard !includeScrollback else { return nil }
 
         var hasher = Hasher()
-        let contexts = mainWindowContexts.values.sorted { lhs, rhs in
+        let routes = mainWindowSessionPersistenceRoutes().sorted { lhs, rhs in
             lhs.windowId.uuidString < rhs.windowId.uuidString
         }
-        hasher.combine(contexts.count)
+        hasher.combine(routes.count)
 
-        for context in contexts.prefix(SessionPersistencePolicy.maxWindowsPerSnapshot) {
-            hasher.combine(context.windowId)
+        for route in routes.prefix(SessionPersistencePolicy.maxWindowsPerSnapshot) {
+            hasher.combine(route.windowId)
             hasher.combine(
-                context.tabManager.sessionAutosaveFingerprint(
+                route.tabManager.sessionAutosaveFingerprint(
                     restorableAgentIndex: restorableAgentIndex,
                     surfaceResumeBindingIndex: surfaceResumeBindingIndex
                 )
             )
-            hasher.combine(context.sidebarState.isVisible)
             hasher.combine(
-                Int(SessionPersistencePolicy.sanitizedSidebarWidth(Double(context.sidebarState.persistedWidth)).rounded())
+                existingWindowDock(forWindowId: route.windowId)?.sessionManualUnreadAutosaveFingerprint(
+                    notificationStore: notificationStore
+                )
+            )
+            hasher.combine(route.sidebarSnapshot.isVisible)
+            hasher.combine(
+                Int(SessionPersistencePolicy.sanitizedSidebarWidth(route.sidebarSnapshot.width).rounded())
             )
 
-            switch context.sidebarSelectionState.selection {
+            switch route.sidebarSnapshot.selection {
             case .tabs:
                 hasher.combine(0)
             case .notifications:
                 hasher.combine(1)
             }
 
-            if let window = context.window ?? windowForMainWindowId(context.windowId) {
+            if let window = route.window {
                 Self.hashFrame(window.frame, into: &hasher)
             } else {
                 hasher.combine(-1)
@@ -4386,7 +4746,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
         let loadStart = ProcessInfo.processInfo.systemUptime
 #endif
-        let resumeIndexes = await ProcessDetectedResumeIndexes.load()
+        let ttyDeviceBindings = currentSurfaceTTYDeviceBindings()
+        let resumeIndexes = await ProcessDetectedResumeIndexes.load(
+            ttyDeviceBindings: ttyDeviceBindings
+        )
 #if DEBUG
         loadMs = (ProcessInfo.processInfo.systemUptime - loadStart) * 1000.0
         let fingerprintStart = ProcessInfo.processInfo.systemUptime
@@ -4444,11 +4807,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @discardableResult
+    private func saveSessionSnapshotUsingCachedProcessDetectedIndexes(
+        includeScrollback: Bool,
+        removeWhenEmpty: Bool = false
+    ) -> Bool {
+        // A watchdog fallback or synchronous updater callback must not retry
+        // process or filesystem work on the main actor.
+        let resumeIndexes = ProcessDetectedResumeIndexes.cached(
+            restorableAgentIndex: SharedLiveAgentIndex.shared.index ?? .empty
+        )
+        return saveSessionSnapshot(
+            includeScrollback: includeScrollback,
+            removeWhenEmpty: removeWhenEmpty,
+            restorableAgentIndex: resumeIndexes.restorableAgentIndex,
+            surfaceResumeBindingIndex: resumeIndexes.surfaceResumeBindingIndex
+        )
+    }
+
+    /// Captures the live pane-to-PTY identity before the process scan leaves
+    /// the main actor.  Plain `ssh` commonly drops the CMUX_* environment when
+    /// it is exec'd by a user's shell, so process detection cannot safely use
+    /// environment scope alone.  The terminal surface owns the controlling
+    /// TTY and is the authoritative mapping for this save pass.
+    @MainActor
+    private func currentSurfaceTTYDeviceBindings()
+        -> [SurfaceResumeBindingIndex.PanelKey: Int64] {
+        var bindings: [SurfaceResumeBindingIndex.PanelKey: Int64] = [:]
+        for context in mainWindowContexts.values {
+            for workspace in context.tabManager.tabs {
+                for (panelID, panel) in workspace.panels {
+                    guard let terminal = panel as? TerminalPanel else { continue }
+                    let device = workspace.surfaceTTYDevices[panelID]
+                        ?? terminal.surface.controllingTTYDeviceIdentifier
+                    guard let device, device > 0 else { continue }
+                    bindings[
+                        SurfaceResumeBindingIndex.PanelKey(
+                            workspaceId: workspace.id,
+                            panelId: panelID
+                        )
+                    ] = device
+                }
+            }
+        }
+        return bindings
+    }
+
+    @discardableResult
     private func saveSessionSnapshotIncludingProcessDetectedIndexes(
         includeScrollback: Bool,
         removeWhenEmpty: Bool = false
     ) -> Bool {
-        let resumeIndexes = ProcessDetectedResumeIndexes.loadSynchronously()
+        // Synchronous lifecycle backstops cannot wait for the authoritative off-main load.
+        // Revalidate only the already-cached process generations and argv, and fail closed
+        // with an empty index when startup has not populated that cache yet.
+        let resumeIndexes = ProcessDetectedResumeIndexes.cached(
+            restorableAgentIndex: SharedLiveAgentIndex.shared.index ?? .empty
+        )
         return saveSessionSnapshot(
             includeScrollback: includeScrollback,
             removeWhenEmpty: removeWhenEmpty,
@@ -4463,8 +4877,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         preserveManualRestoreBackupOnMissingPrimary: Bool = false
     ) {
         let generation = nextProcessDetectedSessionSaveGeneration()
+        let ttyDeviceBindings = currentSurfaceTTYDeviceBindings()
         Task { @MainActor [weak self] in
-            let resumeIndexes = await ProcessDetectedResumeIndexes.load()
+            let resumeIndexes = await ProcessDetectedResumeIndexes.load(
+                ttyDeviceBindings: ttyDeviceBindings
+            )
             guard let self,
                   !self.isTerminatingApp,
                   self.isCurrentProcessDetectedSessionSaveGeneration(generation) else { return }
@@ -4607,15 +5024,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         restorableAgentIndex suppliedRestorableAgentIndex: RestorableAgentSessionIndex? = nil,
         surfaceResumeBindingIndex suppliedSurfaceResumeBindingIndex: SurfaceResumeBindingIndex? = nil
     ) -> (snapshot: AppSessionSnapshot?, removedCrashDiagnosticState: Bool) {
-        let contexts = sortedMainWindowContextsForSessionSnapshot()
-        guard !contexts.isEmpty else { return (nil, false) }
+        let routes = mainWindowSessionPersistenceRoutes().sorted { lhs, rhs in
+            let lhsIsKey = lhs.window?.isKeyWindow ?? false
+            let rhsIsKey = rhs.window?.isKeyWindow ?? false
+            if lhsIsKey != rhsIsKey {
+                return lhsIsKey && !rhsIsKey
+            }
+            return lhs.windowId.uuidString < rhs.windowId.uuidString
+        }
+
+        guard !routes.isEmpty else { return (nil, false) }
         let restorableAgentIndex = suppliedRestorableAgentIndex ?? RestorableAgentSessionIndex.load()
         var windows: [SessionWindowSnapshot] = []
         var removedCrashDiagnosticState = false
         let createdAt = Date().timeIntervalSince1970
-        for context in contexts {
+        for route in routes {
             let windowSnapshot = sessionWindowSnapshot(
-                for: context,
+                windowId: route.windowId,
+                tabManager: route.tabManager,
+                window: route.window,
+                sidebarSnapshot: route.sidebarSnapshot,
                 includeScrollback: includeScrollback,
                 restorableAgentIndex: restorableAgentIndex,
                 surfaceResumeBindingIndex: suppliedSurfaceResumeBindingIndex
@@ -4623,7 +5051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             // A window whose live workspaces are only remote-tmux mirrors needs
             // live SSH control connections and should not restore as an empty
             // shell. If local workspaces were dragged in, keep those snapshots.
-            if windowSnapshot.omitsRemoteMirrorOnlyWindow(liveWorkspaces: context.tabManager.tabs) { continue }
+            if windowSnapshot.omitsRemoteMirrorOnlyWindow(liveWorkspaces: route.tabManager.tabs) { continue }
 
             let pruned = SessionPersistencePolicy.pruningCmuxCrashDiagnosticWindows(
                 from: AppSessionSnapshot(
@@ -4655,31 +5083,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         restorableAgentIndex: RestorableAgentSessionIndex,
         surfaceResumeBindingIndex: SurfaceResumeBindingIndex? = nil
     ) -> SessionWindowSnapshot {
-        let tabManagerSnapshot = context.tabManager.sessionSnapshot(
+        sessionWindowSnapshot(
+            windowId: context.windowId,
+            tabManager: context.tabManager,
+            window: context.window ?? windowForMainWindowId(context.windowId),
+            sidebarSnapshot: sessionSidebarSnapshot(for: context),
+            includeScrollback: includeScrollback,
+            restorableAgentIndex: restorableAgentIndex,
+            surfaceResumeBindingIndex: surfaceResumeBindingIndex
+        )
+    }
+
+    func sessionSidebarSnapshot(for context: MainWindowContext) -> SessionSidebarSnapshot {
+        SessionSidebarSnapshot(
+            isVisible: context.sidebarState.isVisible,
+            selection: SessionSidebarSelection(selection: context.sidebarSelectionState.selection),
+            width: SessionPersistencePolicy.sanitizedSidebarWidth(Double(context.sidebarState.persistedWidth))
+        )
+    }
+
+    private func sessionWindowSnapshot(
+        windowId: UUID,
+        tabManager: TabManager,
+        window: NSWindow?,
+        sidebarSnapshot: SessionSidebarSnapshot,
+        includeScrollback: Bool,
+        restorableAgentIndex: RestorableAgentSessionIndex,
+        surfaceResumeBindingIndex: SurfaceResumeBindingIndex? = nil
+    ) -> SessionWindowSnapshot {
+        let tabManagerSnapshot = tabManager.sessionSnapshot(
             includeScrollback: includeScrollback,
             restorableAgentIndex: restorableAgentIndex,
             surfaceResumeBindingIndex: surfaceResumeBindingIndex
         )
 
-        let window = context.window ?? windowForMainWindowId(context.windowId)
         // Fold the live window's current frame into its per-config ring so the
         // saved snapshot always carries the freshest geometry for the current
         // configuration (subject to the capture firewall).
         if let window {
             captureWindowConfigFrame(window, reason: "sessionSnapshot")
         }
+        let dockSnapshot = existingWindowDock(forWindowId: windowId)?.sessionSnapshot(
+            includeScrollback: includeScrollback,
+            restorableAgentIndex: restorableAgentIndex,
+            surfaceResumeBindingIndex: surfaceResumeBindingIndex
+        )
         return SessionWindowSnapshot(
-            windowId: context.windowId,
+            windowId: windowId,
             frame: window.map { SessionRectSnapshot($0.frame) },
             display: displaySnapshot(for: window),
             tabManager: tabManagerSnapshot,
-            sidebar: SessionSidebarSnapshot(
-                isVisible: context.sidebarState.isVisible,
-                selection: SessionSidebarSelection(selection: context.sidebarSelectionState.selection),
-                width: SessionPersistencePolicy.sanitizedSidebarWidth(Double(context.sidebarState.persistedWidth))
-            ),
-            configFrames: windowConfigFrames[context.windowId]?.entries,
-            dock: context.windowDockSessionSnapshot(includeScrollback: includeScrollback, restorableAgentIndex: restorableAgentIndex, surfaceResumeBindingIndex: surfaceResumeBindingIndex)
+            sidebar: sidebarSnapshot,
+            configFrames: windowConfigFrames[windowId]?.entries,
+            dock: dockSnapshot
         )
     }
 
@@ -4746,7 +5202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         } else {
             mobileWorkspaceListObservers[id] = MobileWorkspaceListObserver(
                 tabManager: tabManager,
-                notificationStore: notificationStore,
+                sidebarUnread: notificationStore?.sidebarUnread,
                 configStore: configStore
             )
         }
@@ -4757,6 +5213,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return
         }
         mobileWorkspaceListObservers.removeValue(forKey: ObjectIdentifier(tabManager))
+    }
+
+    private func finalizeRejectedMainWindowRegistrationIfUnowned(_ tabManager: TabManager) {
+        guard !ownsMainWindowTabManager(tabManager) else { return }
+        tabManager.finalizeAllWorkspacesForWindowClose()
     }
 
     /// Register a terminal window with the AppDelegate so menu commands and socket control
@@ -4771,10 +5232,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         cmuxConfigStore: CmuxConfigStore? = nil
     ) {
         let key = ObjectIdentifier(window)
-        forgetRecoverableMainWindowRoute(windowId: windowId)
+        let exactContextOwner = mainWindowContext(forExactWindowIdentity: window)
+        let exactIdentityOwner = exactContextOwner.map { context in
+            (windowId: context.windowId, tabManager: context.tabManager)
+        } ?? recoverableMainWindowIdentity(forExactWindow: window)
+        if let exactIdentityOwner,
+           exactIdentityOwner.windowId != windowId || exactIdentityOwner.tabManager !== tabManager {
+#if DEBUG
+            cmuxDebugLog(
+                "mainWindow.register.exactOwnerMismatch supplied=\(String(windowId.uuidString.prefix(8))) " +
+                    "owner=\(String(exactIdentityOwner.windowId.uuidString.prefix(8)))"
+            )
+#endif
+            finalizeRejectedMainWindowRegistrationIfUnowned(tabManager)
+            return
+        }
+        if let windowIdOwner = mainWindowContexts.values.first(where: { $0.windowId == windowId }),
+           windowIdOwner.tabManager !== tabManager {
+#if DEBUG
+            cmuxDebugLog(
+                "mainWindow.register.windowIdOwnerMismatch windowId=\(String(windowId.uuidString.prefix(8)))"
+            )
+#endif
+            finalizeRejectedMainWindowRegistrationIfUnowned(tabManager)
+            window.orderOut(nil)
+            window.close()
+            return
+        }
+        guard !tabManager.isFinalizedForWindowClose else {
+            mainWindowVisibilityController.commitClose(window)
+            window.orderOut(nil)
+            window.close()
+            return
+        }
+        guard !mainWindowVisibilityController.hasCommittedClose(for: window) else {
+            // SwiftUI's window accessor can run once more while dismantling a
+            // retained NSWindow. A committed close is authoritative: never
+            // recreate its context or give its terminal graph a respawn route.
+            finalizeRejectedMainWindowRegistrationIfUnowned(tabManager)
+            return
+        }
+        let recoverableRoute = recoverableMainWindowRoute(windowId: windowId)
+        if let recoverableRoute,
+           recoverableRoute.tabManager !== tabManager {
+#if DEBUG
+            cmuxDebugLog(
+                "mainWindow.register.recoverableOwnerMismatch windowId=\(String(windowId.uuidString.prefix(8)))"
+            )
+#endif
+            finalizeRejectedMainWindowRegistrationIfUnowned(tabManager)
+            window.orderOut(nil)
+            window.close()
+            return
+        }
+        if let tabManagerOwnerWindowId = self.windowId(for: tabManager),
+           tabManagerOwnerWindowId != windowId {
+#if DEBUG
+            cmuxDebugLog(
+                "mainWindow.register.tabManagerOwnerMismatch supplied=\(String(windowId.uuidString.prefix(8))) " +
+                    "owner=\(String(tabManagerOwnerWindowId.uuidString.prefix(8)))"
+            )
+#endif
+            window.orderOut(nil)
+            window.close()
+            return
+        }
         #if DEBUG
         let priorManagerToken = debugManagerToken(self.tabManager)
         #endif
+        let registeredContext: MainWindowContext
         if let existing = mainWindowContexts[key] {
             tabManager.window = window
             tabManager.windowId = existing.windowId
@@ -4792,6 +5318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 existing.cmuxConfigStore = cmuxConfigStore
             }
             existing.closeObserver = WindowCloseObserver(window: window) { [weak self] in self?.unregisterMainWindow($0) }
+            registeredContext = existing
         } else if let existing = mainWindowContexts.values.first(where: { $0.windowId == windowId }) {
             if let existingWindow = existing.window,
                existingWindow !== window,
@@ -4809,6 +5336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     tabManager: existing.tabManager,
                     fileExplorerState: existing.fileExplorerState
                 )
+                finalizeRejectedMainWindowRegistrationIfUnowned(tabManager)
                 window.orderOut(nil)
                 window.close()
                 return
@@ -4830,6 +5358,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
             reindexMainWindowContextIfNeeded(existing, for: window)
             existing.closeObserver = WindowCloseObserver(window: window) { [weak self] in self?.unregisterMainWindow($0) }
+            registeredContext = existing
         } else {
             tabManager.window = window
             tabManager.windowId = windowId
@@ -4846,6 +5375,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             )
             mainWindowContexts[key] = context
             context.closeObserver = WindowCloseObserver(window: window) { [weak self] in self?.unregisterMainWindow($0) }
+            registeredContext = context
+        }
+        if recoverableRoute?.tabManager === tabManager {
+            if let recoveredDock = recoverableRoute?.takeWindowDock() {
+                registeredContext.adoptRecoveredWindowDock(recoveredDock)
+            }
+            adoptRecoverableMainWindowRoute(windowId: windowId)
         }
         commandPaletteWindowStore.registerWindow(windowId)
 
@@ -5087,11 +5623,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if destinationWorkspace.id == sourceWorkspace.id {
             if let splitTarget {
                 guard let sourceTabId = sourceWorkspace.surfaceIdFromPanelId(panelId),
-                      sourceWorkspace.bonsplitController.splitPane(
+                      sourceWorkspace.splitPaneMovingTab(
                         resolvedTargetPane,
                         orientation: splitTarget.orientation,
                         movingTab: sourceTabId,
-                        insertFirst: splitTarget.insertFirst
+                        insertFirst: splitTarget.insertFirst,
+                        focusIntent: focus ? .activateMovedTab : .preserveCurrent
                       ) != nil else {
 #if DEBUG
                     cmuxDebugLog(
@@ -5180,11 +5717,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             let splitStart = ProcessInfo.processInfo.systemUptime
 #endif
             guard let movedTabId = destinationWorkspace.surfaceIdFromPanelId(panelId),
-                  destinationWorkspace.bonsplitController.splitPane(
+                  destinationWorkspace.splitPaneMovingTab(
                     resolvedTargetPane,
                     orientation: splitTarget.orientation,
                     movingTab: movedTabId,
-                    insertFirst: splitTarget.insertFirst
+                    insertFirst: splitTarget.insertFirst,
+                    focusIntent: focus ? .activateMovedTab : .preserveCurrent
                   ) != nil else {
                 if let detachedFromDestination = destinationWorkspace.detachSurface(panelId: panelId) {
                     rollbackDetachedSurface(
@@ -5252,6 +5790,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     @discardableResult
+    /// Every workspace whose panes are local surface resources, across all main windows.
+    func surfaceCatalogWorkspaces() -> [Workspace] {
+        var managers: [TabManager] = mainWindowContexts.values.map(\.tabManager)
+        if let tabManager, !managers.contains(where: { $0 === tabManager }) {
+            managers.append(tabManager)
+        }
+        return managers.flatMap(\.tabs)
+    }
+
     func moveBonsplitTab(
         tabId: UUID,
         toWorkspace targetWorkspaceId: UUID,
@@ -5340,10 +5887,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             setActiveMainWindow(window)
             bringToFront(window)
         }
-        let workspace = state.tabManager.addWorkspace(
+        guard let workspace = state.tabManager.addWorkspaceIfActive(
             workingDirectory: workingDirectory,
             select: shouldBringToFront
-        )
+        ) else { return nil }
         return workspace.id
     }
 
@@ -5893,7 +6440,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func focusMainWindow(windowId: UUID) -> Bool {
-        guard let window = windowForMainWindowId(windowId) else { return false }
+        let window: NSWindow?
+        if let route = recoverableMainWindowRoute(windowId: windowId) {
+            window = liveRecoverableMainWindow(windowId: windowId, cachedWindow: route.window)
+        } else {
+            window = windowForMainWindowId(windowId)
+        }
+        guard let window else { return false }
         let didFocus = mainWindowVisibilityController.focus(window, reason: .focusMainWindow)
         if didFocus {
             publishCmuxWindowLifecycle(name: "window.focused", windowId: windowId, origin: "focus_request")
@@ -5902,18 +6455,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func closeMainWindow(windowId: UUID, recordHistory: Bool = true) -> Bool {
-        guard let window = windowForMainWindowId(windowId) else { return false }
-        if !recordHistory {
-            closedWindowHistorySuppressedWindowIds.insert(windowId)
+        let didClose: Bool
+        if let window = mainWindowForClose(windowId: windowId) {
+            if !recordHistory {
+                closedWindowHistorySuppressedWindowIds.insert(windowId)
+            }
+            didClose = closeMainWindowWithoutInteractiveVeto(window)
+        } else {
+            // A recoverable SwiftUI route may intentionally be windowless while
+            // its manager remains the authoritative owner. The shared commit
+            // transaction already supports `window == nil`; use it rather than
+            // stranding a last workspace behind an NSWindow requirement.
+            guard let route = recoverableMainWindowRoute(windowId: windowId),
+                  route.window == nil,
+                  let manager = route.tabManager else {
+                return false
+            }
+            if !recordHistory {
+                closedWindowHistorySuppressedWindowIds.insert(windowId)
+            }
+            didClose = commitMainWindowClose(
+                windowId: windowId,
+                tabManager: manager,
+                context: nil,
+                window: nil
+            )
         }
-        closeMainWindowWithoutInteractiveVeto(window)
-        return true
+        if !didClose, !recordHistory {
+            closedWindowHistorySuppressedWindowIds.remove(windowId)
+        }
+        return didClose
     }
 
     func discardMainWindowWithoutClosedHistory(windowId: UUID) {
-        guard let window = windowForMainWindowId(windowId) else { return }
+        guard let window = mainWindowForClose(windowId: windowId) else { return }
         closedWindowHistorySuppressedWindowIds.insert(windowId)
-        closeMainWindowWithoutInteractiveVeto(window)
+        if !closeMainWindowWithoutInteractiveVeto(window) {
+            closedWindowHistorySuppressedWindowIds.remove(windowId)
+        }
     }
 
     private func confirmCloseMainWindow(_ window: NSWindow) -> Bool {
@@ -6061,7 +6640,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard let window = windowForMainWindowId(context.windowId) else {
             return nil
         }
-        reindexMainWindowContextIfNeeded(context, for: window)
+        guard reindexMainWindowContextIfNeeded(context, for: window) else {
+            return nil
+        }
         return window
     }
 
@@ -6073,13 +6654,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return UUID(uuidString: suffix)
     }
 
-    private func reindexMainWindowContextIfNeeded(_ context: MainWindowContext, for window: NSWindow) {
+    @discardableResult
+    private func reindexMainWindowContextIfNeeded(
+        _ context: MainWindowContext,
+        for window: NSWindow
+    ) -> Bool {
         let desiredKey = ObjectIdentifier(window)
         if mainWindowContexts[desiredKey] === context {
             context.window = window
-            return
+            return true
         }
 
+        // An identifier match is only a lookup hint. Registration validates the
+        // full window-ID/manager/window tuple and assigns `context.window` before
+        // asking to reindex; an unregistered same-ID AppKit window owns nothing.
+        guard context.window === window else { return false }
+        if let conflicting = mainWindowContexts[desiredKey], conflicting !== context {
+            return false
+        }
         let contextKeys = mainWindowContexts.compactMap { key, value in
             value === context ? key : nil
         }
@@ -6087,30 +6679,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             mainWindowContexts.removeValue(forKey: key)
         }
 
-        if let conflicting = mainWindowContexts[desiredKey], conflicting !== context {
-            context.window = window
-            return
-        }
-
         mainWindowContexts[desiredKey] = context
         context.window = window
         notifyMainWindowContextsDidChange()
+        return true
+    }
+
+    private func repairMismatchedMainWindowContextIndex() {
+        var seenContexts = Set<ObjectIdentifier>()
+        let contexts = mainWindowContexts.values.filter { context in
+            seenContexts.insert(ObjectIdentifier(context)).inserted
+        }
+        var repaired: [ObjectIdentifier: MainWindowContext] = [:]
+        var indexedContextIds = Set<ObjectIdentifier>()
+
+        // Exact live window identities get their canonical keys first.
+        for context in contexts {
+            guard let window = context.window else { continue }
+            let key = ObjectIdentifier(window)
+            guard repaired[key] == nil else { continue }
+            repaired[key] = context
+            indexedContextIds.insert(ObjectIdentifier(context))
+        }
+
+        // A windowless context still owns its manager and window ID. Keep it
+        // indexed under its own live identity so an old NSWindow address can
+        // never become authority if AppKit later reuses that address.
+        for context in contexts
+        where !indexedContextIds.contains(ObjectIdentifier(context)) {
+            repaired[ObjectIdentifier(context)] = context
+        }
+
+        mainWindowContexts = repaired
+        notifyMainWindowContextsDidChange()
+    }
+
+    private func mainWindowContext(forExactWindowIdentity window: NSWindow) -> MainWindowContext? {
+        let key = ObjectIdentifier(window)
+        if let indexedContext = mainWindowContexts[key] {
+            if indexedContext.window === window {
+                return indexedContext
+            }
+            repairMismatchedMainWindowContextIndex()
+        }
+
+        guard let exactContext = mainWindowContexts.values.first(where: { $0.window === window }),
+              reindexMainWindowContextIfNeeded(exactContext, for: window) else {
+            return nil
+        }
+        return exactContext
     }
 
     func contextForMainTerminalWindow(_ window: NSWindow, reindex: Bool = true) -> MainWindowContext? {
         guard isMainTerminalWindow(window) else { return nil }
 
-        if let context = mainWindowContexts[ObjectIdentifier(window)] {
-            context.window = window
+        if let context = mainWindowContext(forExactWindowIdentity: window) {
             return context
         }
 
         if let windowId = mainWindowId(from: window),
            let context = mainWindowContexts.values.first(where: { $0.windowId == windowId }) {
             if reindex {
-                reindexMainWindowContextIfNeeded(context, for: window)
+                guard reindexMainWindowContextIfNeeded(context, for: window) else {
+                    return nil
+                }
             } else {
-                context.window = window
+                guard context.window === window else { return nil }
             }
             return context
         }
@@ -6122,9 +6756,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                return candidateWindow?.windowNumber == windowNumber
            }) {
             if reindex {
-                reindexMainWindowContextIfNeeded(context, for: window)
+                guard reindexMainWindowContextIfNeeded(context, for: window) else {
+                    return nil
+                }
             } else {
-                context.window = window
+                guard context.window === window else { return nil }
             }
             return context
         }
@@ -6132,33 +6768,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return nil
     }
 
-    private func unregisterMainWindowContext(for window: NSWindow) -> MainWindowContext? {
-        guard let removed = contextForMainTerminalWindow(window, reindex: false) else { return nil }
-        removed.teardownWindowDock()
+    @discardableResult
+    private func removeMainWindowContext(
+        _ context: MainWindowContext,
+        rememberRecoverableRoute: Bool
+    ) -> MainWindowContext? {
+        guard mainWindowContexts.values.contains(where: { $0 === context }) else { return nil }
+        let sidebarSnapshot = sessionSidebarSnapshot(for: context)
+        let recoverableWindowDock: DockSplitStore?
+        if rememberRecoverableRoute {
+            recoverableWindowDock = context.detachWindowDockForContextReplacement()
+        } else {
+            context.teardownWindowDock()
+            recoverableWindowDock = nil
+        }
         let removedKeys = mainWindowContexts.compactMap { key, value in
-            value === removed ? key : nil
+            value === context ? key : nil
         }
         for key in removedKeys {
             mainWindowContexts.removeValue(forKey: key)
         }
-        rememberRecoverableMainWindowRoute(windowId: removed.windowId, tabManager: removed.tabManager, window: removed.window)
-        removeMobileWorkspaceListObserverIfUnused(for: removed.tabManager)
+        if rememberRecoverableRoute {
+            rememberRecoverableMainWindowRoute(
+                windowId: context.windowId,
+                tabManager: context.tabManager,
+                window: context.window,
+                sidebarSnapshot: sidebarSnapshot,
+                windowDock: recoverableWindowDock
+            )
+        } else {
+            forgetRecoverableMainWindowRoute(windowId: context.windowId)
+        }
+        removeMobileWorkspaceListObserverIfUnused(for: context.tabManager)
         notifyMainWindowContextsDidChange()
-        return removed
+        return context
     }
 
     // Internal (not private): see notifyMainWindowContextsDidChange.
     func discardOrphanedMainWindowContext(_ context: MainWindowContext, allowWindowlessFallback: Bool = false) {
-        context.teardownWindowDock()
-        let contextKeys = mainWindowContexts.compactMap { key, value in
-            value === context ? key : nil
-        }
-        for key in contextKeys {
-            mainWindowContexts.removeValue(forKey: key)
-        }
-        rememberRecoverableMainWindowRoute(windowId: context.windowId, tabManager: context.tabManager, window: context.window)
-        removeMobileWorkspaceListObserverIfUnused(for: context.tabManager)
-        notifyMainWindowContextsDidChange()
+        guard removeMainWindowContext(context, rememberRecoverableRoute: true) != nil else { return }
 
         commandPaletteWindowStore.removeWindow(context.windowId)
 
@@ -6857,7 +7505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         switch command {
         case .focus:
             requiresWindowFocus = true
-        case .setMode(_, let focus):
+        case .setMode(_, let focus), .setCustomSidebar(_, let focus):
             requiresWindowFocus = focus
         case .toggle, .show, .hide, .getState:
             requiresWindowFocus = false
@@ -6916,6 +7564,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 state.setVisible(true)
                 state.mode = mode
                 context?.keyboardFocusCoordinator.rememberRightSidebarMode(mode)
+            }
+            return .ok
+
+        case .setCustomSidebar(let name, let focus):
+            guard CmuxExtensionSidebarSelection.customSidebarsEnabled else {
+                return .failure(String(localized: "rightSidebar.remote.error.customSidebarsDisabled", defaultValue: "ERROR: Custom sidebars are disabled (enable them in Settings → Beta Features)"))
+            }
+            if let name {
+                guard CmuxExtensionSidebarSelection.customSidebarFileURL(forName: name) != nil else {
+                    return .failure(String(localized: "rightSidebar.remote.error.customSidebarNotFound", defaultValue: "ERROR: No custom sidebar named '\(name)' in ~/.config/cmux/sidebars"))
+                }
+                state.selectCustomSidebar(name: name)
+            }
+            guard let selected = state.customSidebarName,
+                  CmuxExtensionSidebarSelection.customSidebarFileURL(forName: selected) != nil else {
+                return .failure(String(localized: "rightSidebar.remote.error.customSidebarUnset", defaultValue: "ERROR: No custom sidebar selected; run right_sidebar set custom <name>"))
+            }
+            if focus {
+                guard focusRightSidebarInActiveMainWindow(mode: .customSidebar, focusFirstItem: true, preferredWindow: preferredWindow) else {
+                    return .failure(String(localized: "rightSidebar.remote.error.focusFailed", defaultValue: "ERROR: Failed to focus right sidebar"))
+                }
+            } else {
+                state.setVisible(true)
+                state.mode = .customSidebar
+                context?.keyboardFocusCoordinator.rememberRightSidebarMode(.customSidebar)
             }
             return .ok
         case .getState:
@@ -7022,6 +7695,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         keyboardFocusCoordinator(for: window)?.allowsTerminalFocus(workspaceId: workspaceId, panelId: panelId) ?? true
     }
 
+    func ownsMainPanelKeyboardFocus(
+        workspaceId: UUID,
+        containerPanelId: UUID,
+        surfaceId: UUID,
+        in window: NSWindow?
+    ) -> Bool {
+        keyboardFocusCoordinator(for: window)?.ownsMainPanelInputFocus(
+            workspaceId: workspaceId,
+            containerPanelId: containerPanelId,
+            surfaceId: surfaceId
+        ) ?? false
+    }
+
     func syncBonsplitTabShortcutHintEligibility(in window: NSWindow?) {
         if let coordinator = keyboardFocusCoordinator(for: window) {
             coordinator.syncBonsplitTabShortcutHintEligibility()
@@ -7094,6 +7780,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             dlog(
                 "rs.focus.app.abort reason=noContext preferred={\(debugWindowToken(preferredWindow))} " +
                 "\(debugShortcutRouteSnapshot())"
+            )
+#endif
+            return false
+        }
+        guard context.keyboardFocusCoordinator.canFocusRightSidebar(mode: requestedMode) else {
+#if DEBUG
+            dlog(
+                "rs.focus.app.abort reason=unavailable requested=\(requestedMode?.rawValue ?? "nil") " +
+                    "preferred={\(debugWindowToken(preferredWindow))} context={\(debugContextToken(context))}"
             )
 #endif
             return false
@@ -7372,8 +8067,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         didScheduleInitialMainWindowBootstrap = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            if self.didHandleExplicitOpenIntentAtStartup {
+                self.didScheduleInitialMainWindowBootstrap = false
+                return
+            }
+            if self.isWaitingForStartupCrashRecoveryProbe {
+                self.didScheduleInitialMainWindowBootstrap = false
+                if self.deferredInitialMainWindowBootstrapDebugSource == nil {
+                    self.deferredInitialMainWindowBootstrapDebugSource = debugSource
+                }
+                return
+            }
             if self.shouldDeferInitialMainWindowBootstrapForExternalConfirmation { self.didScheduleInitialMainWindowBootstrap = false; return }
             self.bootstrapInitialMainWindowIfNeeded(debugSource: debugSource)
+        }
+    }
+
+    /// Tracks the `TabManager` instance SwiftUI installs for the app's
+    /// bootstrap scene so the first real main-window activation can retire it.
+    func adoptInitialMainWindowBootstrapManager(_ bootstrapManager: TabManager) {
+        guard !bootstrapManager.isFinalizedForWindowClose else { return }
+        guard mainWindowContexts.isEmpty else {
+            finalizeRejectedMainWindowRegistrationIfUnowned(bootstrapManager)
+            return
+        }
+
+        let priorOwner = tabManager
+        tabManager = bootstrapManager
+        if let priorOwner, priorOwner !== bootstrapManager {
+            finalizeRejectedMainWindowRegistrationIfUnowned(priorOwner)
         }
     }
 
@@ -7517,14 +8239,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return createdWorkspace
     }
 
-    /// Opens the iPhone pairing flow as a dedicated workspace, reusing the
+    /// Opens the Tailscale pairing flow as a dedicated workspace, reusing the
     /// existing pairing workspace in the target window when one is open.
     ///
     /// - Parameters:
     ///   - preferredTabManager: The target window's workspace manager.
     ///   - preferredWindow: The target main window, when known.
     ///   - focusWorkspace: Whether to select and focus the pairing workspace.
-    ///   - enforceFeatureFlag: Whether the Mobile Connect button flag gates the action.
+    ///   - enforceFeatureFlag: Whether the Tailscale Pairing button flag gates the action.
     ///   - bringWindowForward: Whether to activate the resolved main window.
     ///   - debugSource: The entrypoint name used in debug diagnostics.
     /// - Returns: The reused or newly created pairing workspace, or `nil` when unavailable.
@@ -7537,6 +8259,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         bringWindowForward: Bool = false,
         debugSource: String = "mobileConnect"
     ) -> Workspace? {
+        // Shared chokepoint for every pairing-window entry (Settings, palette,
+        // menu): pairing is unavailable under a managed remote-control disable.
+        guard MobileRemoteControlPolicy.isEnabled else {
+#if DEBUG
+            cmuxDebugLog("mobileConnect.blocked_managed_policy source=\(debugSource)")
+#endif
+            return nil
+        }
         guard !enforceFeatureFlag || CmuxFeatureFlags.shared.isMobileConnectButtonEnabled else {
 #if DEBUG
             cmuxDebugLog("mobileConnect.blocked_flag source=\(debugSource)")
@@ -7565,15 +8295,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return workspace
         }
 
-        let title = String(localized: "mobile.pairing.window.title", defaultValue: "Pair iPhone")
-        let workspace = manager.addWorkspace(
+        let title = String(localized: "mobile.pairing.window.title", defaultValue: "Tailscale Pairing")
+        guard let workspace = manager.addWorkspaceIfActive(
             title: title,
             select: focusWorkspace,
             eagerLoadTerminal: false,
             autoWelcomeIfNeeded: false,
             autoRefreshMetadata: false,
             allowTextBoxFocusDefault: false
-        )
+        ) else {
+            return nil
+        }
         guard let initialPanelID = workspace.focusedPanelId,
               let paneID = workspace.paneId(forPanelId: initialPanelID),
               workspace.newMobilePairingSurface(inPane: paneID, focus: focusWorkspace) != nil else {
@@ -7661,14 +8393,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                     // The fresh window boots with a terminal workspace; add the
                     // browser workspace and close that initial one so the
                     // action's result matches the no-window case for terminals.
-                    let workspace = context.tabManager.addWorkspace(
+                    guard let workspace = context.tabManager.addWorkspaceIfActive(
                         title: title,
                         initialSurface: .browser,
                         initialBrowserURL: initialBrowserURL,
                         initialBrowserOmnibarVisible: initialBrowserOmnibarVisible,
                         initialBrowserTransparentBackground: initialBrowserTransparentBackground,
                         applyCreationTitleAsCustomTitle: applyCreationTitleAsCustomTitle
-                    )
+                    ) else { return false }
                     closeInitialWorkspaceIfNeeded(
                         initialWorkspaceId: initialWorkspace?.id,
                         in: context
@@ -7678,7 +8410,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                         focusInitialBrowserAddressBar(in: workspace)
                     }
                 case .cloudVMLoading:
-                    let workspace = context.tabManager.addWorkspace(initialSurface: .cloudVMLoading)
+                    guard let workspace = context.tabManager.addWorkspaceIfActive(initialSurface: .cloudVMLoading) else {
+                        return false
+                    }
                     closeInitialWorkspaceIfNeeded(
                         initialWorkspaceId: initialWorkspace?.id,
                         in: context
@@ -7729,14 +8463,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         if let preferredTabManager,
            preferredContext == nil || livePreferredContext != nil {
-            let workspace = preferredTabManager.addWorkspace(
+            guard let workspace = preferredTabManager.addWorkspaceIfActive(
                 title: title,
                 initialSurface: initialSurface,
                 initialBrowserURL: initialBrowserURL,
                 initialBrowserOmnibarVisible: initialBrowserOmnibarVisible,
                 initialBrowserTransparentBackground: initialBrowserTransparentBackground,
                 applyCreationTitleAsCustomTitle: applyCreationTitleAsCustomTitle
-            )
+            ) else { return false }
             createdWorkspaceHandler?(workspace)
             if initialSurface == .browser, focusInitialBrowserAddressBarOnCreate {
                 focusInitialBrowserAddressBar(in: workspace)
@@ -7815,6 +8549,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         debugSource: String = "cloudVM",
         onCompletion: ((CloudVMActionLauncher.Completion) -> Void)? = nil
     ) -> Bool {
+        let authState = CloudVMPanelAuthState.resolve(
+            isAuthenticated: auth?.accountFlow.isAuthenticated == true,
+            isWorkingOnAuth: auth?.accountFlow.isWorkingOnAuth == true
+        )
+        guard authState.allowsAuthenticatedOperation else {
+            _ = performAccountSignInWorkspaceAction(
+                preferredWindow: preferredWindow,
+                debugSource: "\(debugSource).auth"
+            )
+            return false
+        }
         let context = preferredTabManager.flatMap { mainWindowContext(for: $0) }
             ?? preferredWindow.flatMap { contextForMainWindow($0) }
             ?? preferredMainWindowContextForWorkspaceCreation(event: nil, debugSource: debugSource)
@@ -7842,24 +8587,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 return true
             }
         } else {
-            workspace = context.tabManager.addWorkspace(
+            guard let createdWorkspace = context.tabManager.addWorkspaceIfActive(
                 title: workspaceTitle,
                 titleSource: .auto,
                 initialSurface: .cloudVMLoading,
                 inheritWorkingDirectory: false,
                 select: true,
                 autoWelcomeIfNeeded: false
-            )
+            ) else { return false }
+            workspace = createdWorkspace
             context.tabManager.setPinned(workspace, pinned: true)
+            // First Base is a real choice (screen or shell-only), so ask before
+            // provisioning. Once Base exists the open reuses it and no sheet
+            // appears; if the fleet can't be read, open directly and let the
+            // CLI report the real error in the loading panel.
+            let launchWindow = resolvedWindow(for: context) ?? preferredWindow
+            let tabManager = context.tabManager
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let page = await Self.cloudVMFleetPage()
+                if page?.vms.contains(where: { $0.base != nil }) != false {
+                    _ = self.launchCloudVMBaseOpen(
+                        workspace: workspace,
+                        socketPath: socketPath,
+                        preferredWindow: launchWindow,
+                        arguments: ["vm", "base", "open", "--workspace", workspace.id.uuidString],
+                        onCompletion: onCompletion
+                    )
+                    return
+                }
+                let model = NewMachineModel(
+                    mode: .base(workspaceID: workspace.id),
+                    plan: MachineSnapshotBuilder.planSnapshot(activeCount: page?.vms.count ?? 0, limits: page?.limits),
+                    imageKinds: page?.limits?.imageKinds ?? [],
+                    launch: { [weak self] arguments, completion in
+                        guard let self else { return false }
+                        return self.launchCloudVMBaseOpen(
+                            workspace: workspace,
+                            socketPath: socketPath,
+                            preferredWindow: launchWindow,
+                            arguments: arguments,
+                            onCompletion: { result in
+                                completion(result)
+                                onCompletion?(result)
+                            }
+                        )
+                    }
+                )
+                model.onFinished = { outcome in
+                    guard outcome == .cancelled else { return }
+                    // Nothing was provisioned: take the placeholder workspace back down.
+                    tabManager.closeWorkspace(workspace, recordHistory: false)
+                    onCompletion?(CloudVMActionLauncher.Completion(terminationStatus: 1, output: "", workspaceId: nil))
+                }
+                NewMachineSheetPresenter.shared.present(model: model, preferredWindow: launchWindow)
+            }
+            return true
         }
+        return launchCloudVMBaseOpen(
+            workspace: workspace,
+            socketPath: socketPath,
+            preferredWindow: resolvedWindow(for: context) ?? preferredWindow,
+            arguments: ["vm", "base", "open", "--workspace", workspace.id.uuidString],
+            onCompletion: onCompletion
+        )
+    }
+
+    /// The fleet as `GET /api/vm` reports it; nil when signed out or unreachable.
+    private static func cloudVMFleetPage() async -> VMListPage? {
+        guard let client = VMClient.shared else { return nil }
+        return try? await client.listPage()
+    }
+
+    /// Runs `cmux vm base open …` against `workspace`'s loading panel: the one
+    /// place the Base open CLI is launched, whether the sheet or a plain open
+    /// triggered it. Failures land in the loading panel and in `onCompletion`.
+    @discardableResult
+    private func launchCloudVMBaseOpen(
+        workspace: Workspace,
+        socketPath: String,
+        preferredWindow: NSWindow?,
+        arguments: [String],
+        onCompletion: ((CloudVMActionLauncher.Completion) -> Void)?
+    ) -> Bool {
         if let loadingPanel = workspace.panels.values.first(where: { $0.panelType == .cloudVMLoading }) as? CloudVMLoadingPanel {
             loadingPanel.resetLoading()
         }
         let didStart = CloudVMActionLauncher.shared.start(
             socketPath: socketPath,
-            preferredWindow: resolvedWindow(for: context) ?? preferredWindow,
-            arguments: ["vm", "base", "open", "--workspace", workspace.id.uuidString],
-            showsProgress: false,
+            preferredWindow: preferredWindow,
+            arguments: arguments,
             presentsFailureAlert: false,
             environmentOverrides: [
                 "CMUX_CLOUD_ATTACH_RETRY_LIMIT": "12",
@@ -7888,6 +8705,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             if workspace.panels.values.contains(where: { $0.panelType == .cloudVMLoading }) {
                 return true
             }
+            // Base opened through the cmux-tui daemon: the pane owns the session, so the
+            // workspace carries a binding instead of a remote configuration.
+            if workspace.cloudVMBinding?.isBase == true {
+                return true
+            }
             guard let remote = workspace.remoteConfiguration else { return false }
             return remote.persistentDaemonSlot == "cmux-default-freestyle-sshd-v1" &&
                 remote.managedCloudVMID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
@@ -7901,6 +8723,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         preferredWindow: NSWindow? = nil,
         debugSource: String = "cloudVM.current"
     ) -> Bool {
+        let authState = CloudVMPanelAuthState.resolve(
+            isAuthenticated: auth?.accountFlow.isAuthenticated == true,
+            isWorkingOnAuth: auth?.accountFlow.isWorkingOnAuth == true
+        )
+        guard authState.allowsAuthenticatedOperation else {
+            _ = performAccountSignInWorkspaceAction(
+                preferredWindow: preferredWindow,
+                debugSource: "\(debugSource).auth"
+            )
+            return false
+        }
         let context = preferredTabManager.flatMap { mainWindowContext(for: $0) }
             ?? preferredWindow.flatMap { contextForMainWindow($0) }
             ?? preferredMainWindowContextForWorkspaceCreation(event: nil, debugSource: debugSource)
@@ -7933,6 +8766,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         preferredWindow: NSWindow? = nil,
         debugSource: String = "cloudVM.restore"
     ) -> Bool {
+        let authState = CloudVMPanelAuthState.resolve(
+            isAuthenticated: auth?.accountFlow.isAuthenticated == true,
+            isWorkingOnAuth: auth?.accountFlow.isWorkingOnAuth == true
+        )
+        guard authState.allowsAuthenticatedOperation else {
+            _ = performAccountSignInWorkspaceAction(
+                preferredWindow: preferredWindow,
+                debugSource: "\(debugSource).auth"
+            )
+            return false
+        }
         let context = preferredWindow.flatMap { contextForMainWindow($0) }
             ?? preferredMainWindowContextForWorkspaceCreation(event: nil, debugSource: debugSource)
         guard let context else {
@@ -8012,15 +8856,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
+    /// Closes every workspace attached to a Cloud VM that no longer exists.
+    /// Deleting a machine from the Cloud panel otherwise leaves a "Connected"
+    /// workspace behind that can never reconnect.
+    func closeWorkspaces(forManagedCloudVMID vmID: String) {
+        let target = vmID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !target.isEmpty else { return }
+        var managers = mainWindowContexts.values.map(\.tabManager)
+        if let tabManager, !managers.contains(where: { $0 === tabManager }) {
+            managers.append(tabManager)
+        }
+        for manager in managers {
+            let doomed = manager.tabs.filter { workspace in
+                workspace.cloudVMID?.lowercased() == target
+            }
+            for workspace in doomed {
+                manager.closeWorkspace(workspace)
+            }
+        }
+        // The sidebar's headless link to that machine has nothing left to talk to.
+        CmuxTuiSurfaceProviderRegistry.shared.machineWasDeleted(vmID.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// The local workspace attached to a cloud machine, through either transport: the
+    /// legacy remote configuration or the cmux-tui binding. Base wins over other
+    /// workspaces of the same machine.
+    func workspace(forCloudVMID vmID: String) -> Workspace? {
+        let target = vmID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !target.isEmpty else { return nil }
+        let candidates = liveWorkspaceIdentityTabManagers(preferredTabManager: tabManager)
+            .flatMap(\.tabs)
+            .filter { $0.cloudVMID?.lowercased() == target }
+        return candidates.first(where: { $0.cloudVMBinding?.isBase == true }) ?? candidates.first
+    }
+
+    /// The workspace that currently hosts a surface, across every window.
+    func workspace(containingSurfaceID surfaceID: UUID) -> Workspace? {
+        for manager in liveWorkspaceIdentityTabManagers(preferredTabManager: tabManager) {
+            if let workspace = manager.tabs.first(where: { $0.panels[surfaceID] != nil }) {
+                return workspace
+            }
+        }
+        return nil
+    }
+
+    /// Tear down every local Cloud VM attachment before the auth session is
+    /// cleared. The VMs remain durable server-side, but no remote socket,
+    /// reconnect command, closed-history entry, or in-flight CLI child may
+    /// survive a signed-out account transition.
+    func prepareCloudVMAccessForSignOut() {
+        CloudVMActionLauncher.shared.cancelAllForAuthTransition()
+
+        for manager in liveWorkspaceIdentityTabManagers() {
+            let cloudWorkspaces = manager.tabs.filter { workspace in
+                workspace.isManagedCloudVMWorkspace ||
+                    workspace.panels.values.contains { $0.panelType == .cloudVMLoading }
+            }
+            for workspace in cloudWorkspaces {
+                // Clear the configuration first even when this is the only tab
+                // in a manager (closeWorkspace intentionally refuses to remove
+                // the final tab). This stops reconnect and proxy work immediately.
+                workspace.disconnectRemoteConnection(
+                    clearConfiguration: true,
+                    disconnectedDetail: String(
+                        localized: "machines.signOut.disconnectedDetail",
+                        defaultValue: "Cloud VM access ended because cmux signed out."
+                    )
+                )
+                if manager.tabs.count > 1 {
+                    manager.closeWorkspace(workspace, recordHistory: false)
+                } else {
+                    workspace.withClosedPanelHistorySuppressed {
+                        workspace.teardownAllPanels()
+                    }
+                }
+            }
+        }
+
+        // A manually reopened closed-workspace snapshot is another attach
+        // entrypoint; remove only Cloud VM records while preserving local tab
+        // history for the next account/session.
+        ClosedItemHistoryStore.shared.removeManagedCloudVMRecords()
+        NotificationCenter.default.post(name: .cmuxCloudVMAccessDidEnd, object: self)
+        _ = saveSessionSnapshotUsingCachedProcessDetectedIndexes(
+            includeScrollback: false,
+            removeWhenEmpty: false
+        )
+    }
+
     private func currentCloudVMId(tabManager: TabManager) -> String? {
         guard let workspaceId = tabManager.selectedTabId,
-              let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }),
-              let vmID = workspace.remoteConfiguration?.managedCloudVMID?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              !vmID.isEmpty else {
+              let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }) else {
             return nil
         }
-        return vmID
+        return workspace.cloudVMID
     }
 
     private func promptForCloudVMSnapshotId(preferredWindow: NSWindow?) -> String? {
@@ -8149,7 +9078,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
               let group = tabManager.workspaceGroups.first(where: { $0.id == groupId }) else {
             return nil
         }
-        let anchorCwd = tabManager.tabs.first(where: { $0.id == group.anchorWorkspaceId })?.currentDirectory
+        let anchorCwd = group.liveAnchorWorkspaceId
+            .flatMap { anchorId in
+                tabManager.tabs.first(where: { $0.id == anchorId })?.currentDirectory
+            }
         let configured = context.cmuxConfigStore?.resolveWorkspaceGroupConfig(forCwd: anchorCwd)?.newWorkspacePlacement
         return WorkspaceGroupNewWorkspaceTarget(
             groupId: groupId,
@@ -8212,9 +9144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return false
         }
 
-        let targetWorkspaceId = targetTabManager.selectedWorkspace?.id
+        guard let targetWorkspaceId = targetTabManager.selectedWorkspace?.id
             ?? targetTabManager.tabs.first?.id
-            ?? targetTabManager.addWorkspace(select: true).id
+            ?? targetTabManager.addWorkspaceIfActive(select: true)?.id else {
+            return false
+        }
         let normalizedDirectoryURL = directoryURL.standardizedFileURL
 
         VSCodeServeWebController.shared.ensureServeWebURL(vscodeApplicationURL: vscodeApplicationURL) { serveWebURL in
@@ -8460,8 +9394,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             setActiveMainWindow(window)
         }
 
-        let workspace = context.tabManager.selectedWorkspace
-            ?? context.tabManager.addWorkspace(select: shouldBringToFront, autoWelcomeIfNeeded: false)
+        guard let workspace = context.tabManager.selectedWorkspace
+            ?? context.tabManager.addWorkspaceIfActive(select: shouldBringToFront, autoWelcomeIfNeeded: false) else {
+            return false
+        }
         // In a remote tmux mirror workspace, paste targets the existing focused
         // pane. Do NOT fall back to creating a new surface there: that would
         // route to a remote `new-window` (a surprising side effect) yet still
@@ -8507,8 +9443,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             setActiveMainWindow(window)
         }
 
-        let workspace = context.tabManager.selectedWorkspace
-            ?? context.tabManager.addWorkspace(workingDirectory: parentDirectory, select: true)
+        guard let workspace = context.tabManager.selectedWorkspace
+            ?? context.tabManager.addWorkspaceIfActive(workingDirectory: parentDirectory, select: true) else {
+            return false
+        }
         guard let paneId = workspace.bonsplitController.focusedPaneId
             ?? workspace.bonsplitController.allPaneIds.first else {
             return false
@@ -8581,9 +9519,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             bringToFront(window)
         }
 
-        let workspace: Workspace
+        let workspace: Workspace?
         if initialSurface == .browser {
-            workspace = context.tabManager.addWorkspace(
+            workspace = context.tabManager.addWorkspaceIfActive(
                 title: title,
                 initialSurface: .browser,
                 initialBrowserURL: initialBrowserURL,
@@ -8593,7 +9531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 applyCreationTitleAsCustomTitle: applyCreationTitleAsCustomTitle
             )
         } else if workingDirectory != nil || initialTerminalInput != nil {
-            workspace = context.tabManager.addWorkspace(
+            workspace = context.tabManager.addWorkspaceIfActive(
                 title: title,
                 workingDirectory: workingDirectory,
                 initialTerminalInput: initialTerminalInput,
@@ -8602,14 +9540,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 applyCreationTitleAsCustomTitle: applyCreationTitleAsCustomTitle
             )
         } else if title != nil {
-            workspace = context.tabManager.addWorkspace(
+            workspace = context.tabManager.addWorkspaceIfActive(
                 title: title,
                 select: true,
                 applyCreationTitleAsCustomTitle: applyCreationTitleAsCustomTitle
             )
         } else {
-            workspace = context.tabManager.addTab(select: true)
+            workspace = context.tabManager.addWorkspaceIfActive(select: true)
         }
+        guard let workspace else { return nil }
         #if DEBUG
         logWorkspaceCreationRouting(
             phase: "created",
@@ -8953,6 +9892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             initialWorkingDirectory: initialWorkingDirectory,
             initialTerminalInput: initialTerminalInput,
             autoWelcomeIfNeeded: initialTerminalInput == nil,
+            tabDragTransferRegistry: tabDragTransferRegistry,
             pullRequestProbeService: pullRequestProbeService,
             workspaceCustomizationStore: self.tabManager?.workspaceCustomizationStore
                 ?? WorkspaceCustomizationStore(defaults: .standard),
@@ -8965,6 +9905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 remapClosedPanelHistory: remapClosedPanelHistoryFromSessionSnapshot,
                 excludingStableIdentities: excludingStableIdentitiesFromSessionSnapshot,
                 excludingWorkspaceIds: excludingWorkspaceIdsFromSessionSnapshot,
+                deferBrowserPanels: true,
                 workspaceCreateIdempotencyCache: TerminalController.shared.workspaceCreateIdempotencyCache
             )
             if let configFrames = sessionWindowSnapshot.configFrames {
@@ -9035,6 +9976,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             .environmentObject(sidebarSelectionState)
             .environmentObject(fileExplorerState)
             .environmentObject(cmuxConfigStore)
+            .environment(\.sessionDragRegistry, sessionDragRegistry)
+            .environment(\.tabDragTransferRegistry, tabDragTransferRegistry)
             // AppKit hosts this ContentView in its own NSHostingView, which does
             // not inherit the App scene's SwiftUI environment. Inject the
             // settings runtime so `@LiveSetting` can resolve the stores it
@@ -9117,6 +10060,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 lastCascadePoint = window.cascadeTopLeft(from: NSPoint(x: window.frame.minX, y: window.frame.maxY))
             }
         }
+        // cmux owns pane focus/selection; AppKit's automatic key-view walk is
+        // recursively traversed while a restored Bonsplit topology is mounted.
+        // Suppress that walk only for the restore transaction; ordinary windows
+        // retain AppKit's default key-view behavior.
+        if isRestoringSessionWindowSnapshot {
+            window.autorecalculatesKeyViewLoop = false
+        }
         window.contentView = MainWindowHostingView(rootView: root)
 
         // Apply shared window styling.
@@ -9130,37 +10080,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         controller.onClose = { [weak self, weak controller] in
             guard let self, let controller else { return }
-            let manager = self.tabManagerFor(windowId: windowId)
-            // An explicit close of the window's LAST remote workspace (a tab/session
-            // close) kills its remote session(s) — synced with tmux — even though it
-            // also closes the app window. A plain window/quit close leaves the marker
-            // unset and falls through to detach below (server stays alive for resume).
-            if self.remoteTmuxController.consumeKillSessionsOnWindowClose(windowId: windowId),
-               let manager {
-                for workspace in manager.tabs where workspace.isRemoteTmuxMirror {
-                    self.remoteTmuxController.handleWorkspaceClosed(workspaceId: workspace.id)
-                }
-            }
-            if let manager {
-                self.remoteTmuxController.handleWindowWorkspacesClosed(
-                    workspaceIds: manager.tabs.map { $0.id }
-                )
+            if let closingWindow = controller.window {
+                self.unregisterMainWindow(closingWindow)
             }
             self.mainWindowControllers.removeAll(where: { $0 === controller })
         }
-        controller.shouldClose = { [weak self] in
-            let shouldClose = self?.handleMainTerminalWindowShouldClose() ?? true
-            if !shouldClose {
-                self?.closedWindowHistorySuppressedWindowIds.remove(windowId)
-                // Close CANCELLED (a genuine veto, not a confirmed quit): clear any
-                // kill-on-close marker so a later window/quit close detaches. A
-                // CONFIRMED quit of the last tab keeps the marker set so
-                // applicationWillTerminate kills the session before exit.
-                if self?.isTerminatingApp != true {
-                    self?.remoteTmuxController.consumeKillSessionsOnWindowClose(windowId: windowId)
-                }
-            }
-            return shouldClose
+        controller.shouldClose = { [weak self] candidateWindow in
+            self?.handleMainTerminalWindowCloseRequest(
+                candidateWindow,
+                windowId: windowId,
+                onCancel: nil
+            ) ?? true
         }
         window.delegate = controller
         mainWindowControllers.append(controller)
@@ -9174,7 +10104,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             fileExplorerState: fileExplorerState,
             cmuxConfigStore: cmuxConfigStore
         )
-        restoreWindowDockSessionSnapshot(forWindowId: windowId, from: sessionWindowSnapshot, excludingStableIdentities: excludingStableIdentitiesFromSessionSnapshot)
+        restoreWindowDockSessionSnapshot(
+            forWindowId: windowId,
+            from: sessionWindowSnapshot,
+            excludingStableIdentities: excludingStableIdentitiesFromSessionSnapshot,
+            deferBrowserPanels: isRestoringSessionWindowSnapshot
+        )
+        if isRestoringSessionWindowSnapshot {
+            window.autorecalculatesKeyViewLoop = true
+            window.recalculateKeyViewLoop()
+        }
         publishCmuxWindowLifecycle(name: "window.created", windowId: windowId, origin: "create")
         installFileDropOverlay(on: window, tabManager: tabManager)
         if !shouldActivate || TerminalController.shouldSuppressSocketCommandActivation() {
@@ -9244,7 +10183,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             setActiveMainWindow(window)
             bringToFront(window)
         }
-        let workspace = context.tabManager.addWorkspace(select: true, autoWelcomeIfNeeded: false)
+        guard let workspace = context.tabManager.addWorkspaceIfActive(select: true, autoWelcomeIfNeeded: false) else {
+            return
+        }
         sendWelcomeCommandWhenReady(to: workspace)
     }
 
@@ -9342,7 +10283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         guard socketListenerConfigurationIfEnabled() != nil else {
-            TerminalController.shared.stop()
+            TerminalController.shared.stop(cleanupDiscoveryState: true)
             NSSound.beep()
             return
         }
@@ -9368,6 +10309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let store = TerminalNotificationStore.shared
         return MenuBarExtraController(
             notificationStore: store,
+            caffeineController: caffeineController,
             onShowGlobalSearch: { button, onDismiss in
                 GlobalSearchCoordinator.shared.togglePalette(anchor: button, onDismiss: onDismiss)
             },
@@ -9480,6 +10422,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         MenuBarOnlySettings.normalizeLegacyStoredPreference(defaults: defaults)
         syncActivationPolicy(defaults: defaults)
         syncMenuBarExtraVisibility(defaults: defaults)
+        computerUseUXCoordinator.install {
+            [weak self] workspaceID, surfaceID, effectIsCurrent in
+            _ = self?.focusTerminal(
+                tabId: workspaceID,
+                surfaceId: surfaceID,
+                while: effectIsCurrent
+            )
+        }
     }
 
     private func installMobileHostSettingsObserver() {
@@ -9696,9 +10646,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         } else {
             payload = logText + "\nLog file: \(updateLog.logPath())"
         }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(payload, forType: .string)
+        GhosttyApp.terminalPasteboard.writeString(
+            payload,
+            to: .general
+        )
     }
     @objc func copyFocusLogs(_ sender: Any?) {
         let logText = focusLog.snapshot()
@@ -9708,9 +10659,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         } else {
             payload = logText + "\nLog file: \(focusLog.logPath())"
         }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(payload, forType: .string)
+        GhosttyApp.terminalPasteboard.writeString(
+            payload,
+            to: .general
+        )
     }
 
     @objc private func handleFeedRequestFocus(_ notification: Notification) {
@@ -10083,8 +11035,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @objc func openDebugScrollbackTab(_ sender: Any?) {
         guard let tabManager else { return }
-        let tab = tabManager.addTab()
-        let config = GhosttyConfig.load()
+        guard let tab = tabManager.addWorkspaceIfActive() else { return }
+        let config = GhosttyConfig.loadForCmux()
         let minimumTargetBytes = 2_000_000
         let maximumTargetBytes = 200_000_000
         let minimumLineCount = 2000
@@ -10103,7 +11055,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @objc func openDebugLoremTab(_ sender: Any?) {
         guard let tabManager else { return }
-        let tab = tabManager.addTab()
+        guard let tab = tabManager.addWorkspaceIfActive() else { return }
         let lineCount = 2000
         let base = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore."
         var lines: [String] = []
@@ -10157,7 +11109,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             if let existing = existingByTitle[title] {
                 targetTab = existing
             } else {
-                targetTab = tabManager.addTab()
+                guard let createdTab = tabManager.addWorkspaceIfActive() else { return }
+                targetTab = createdTab
             }
             tabManager.setCustomTitle(tabId: targetTab.id, title: title)
             tabManager.setTabColor(tabId: targetTab.id, color: entry.hex)
@@ -10190,7 +11143,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
             for index in 0..<self.debugStressWorkspaceCount {
                 let workspaceStart = ProcessInfo.processInfo.systemUptime
-                let workspace = tabManager.addWorkspace(select: false, placementOverride: .end)
+                guard let workspace = tabManager.acquireOptionalWorkspaceIfActive({
+                    tabManager.addWorkspaceIfActive(select: false, placementOverride: .end)
+                }) else {
+                    break
+                }
                 created.append(workspace)
                 tabManager.setCustomTitle(
                     tabId: workspace.id,
@@ -10734,7 +11691,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 waitForContext { context in
                     let tabManager = context.tabManager
                     let initialIndex = tabManager.tabs.firstIndex(where: { $0.id == tabManager.selectedTabId }) ?? 0
-                    let tab = tabManager.addTab()
+                    guard let tab = tabManager.addWorkspaceIfActive() else { return }
                     guard let initialPanelId = tab.focusedPanelId else { return }
 
                     _ = tabManager.newSplit(tabId: tab.id, surfaceId: initialPanelId, direction: .right)
@@ -10906,7 +11863,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 return
             }
 
-            let tab = tabManager.addTab()
+            guard let tab = tabManager.addWorkspaceIfActive() else { return }
             guard let initialPanelId = tab.focusedPanelId else {
                 self.writeGotoSplitTestData(["setupError": "Missing initial panel id"])
                 return
@@ -10949,6 +11906,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard tabManager != nil else { return }
         let startWithHiddenSidebar = env["CMUX_UI_TEST_BONSPLIT_START_WITH_HIDDEN_SIDEBAR"] == "1"
         let showRightSidebar = env["CMUX_UI_TEST_BONSPLIT_SHOW_RIGHT_SIDEBAR"] == "1"
+        let fourTabSetup = env["CMUX_UI_TEST_BONSPLIT_FOUR_TAB_SETUP"] == "1"
 
         let deadline = Date().addingTimeInterval(20.0)
         func mainWindowContextForUITest() -> (window: NSWindow, context: MainWindowContext)? {
@@ -11013,6 +11971,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             let workspaceTitle = "UITest Workspace"
             let alphaTitle = "UITest Alpha"
             let betaTitle = "UITest Beta"
+            let gammaTitle = "UITest Gamma"
+            let deltaTitle = "UITest Delta"
             tabManager.setCustomTitle(tabId: workspace.id, title: workspaceTitle)
             workspace.setPanelCustomTitle(panelId: alphaPanelId, title: alphaTitle)
             tabManager.newSurface()
@@ -11023,6 +11983,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             }
 
             workspace.setPanelCustomTitle(panelId: betaPanelId, title: betaTitle)
+            var gammaPanelId: UUID?
+            var deltaPanelId: UUID?
+            if fourTabSetup {
+                tabManager.newSurface()
+                guard let createdGammaPanelId = workspace.focusedPanelId,
+                      createdGammaPanelId != alphaPanelId,
+                      createdGammaPanelId != betaPanelId else {
+                    self.writeBonsplitTabDragUITestData(["setupError": "Failed to create third surface"])
+                    return
+                }
+                gammaPanelId = createdGammaPanelId
+                workspace.setPanelCustomTitle(panelId: createdGammaPanelId, title: gammaTitle)
+
+                tabManager.newSurface()
+                guard let createdDeltaPanelId = workspace.focusedPanelId,
+                      createdDeltaPanelId != alphaPanelId,
+                      createdDeltaPanelId != betaPanelId,
+                      createdDeltaPanelId != createdGammaPanelId else {
+                    self.writeBonsplitTabDragUITestData(["setupError": "Failed to create fourth surface"])
+                    return
+                }
+                deltaPanelId = createdDeltaPanelId
+                workspace.setPanelCustomTitle(panelId: createdDeltaPanelId, title: deltaTitle)
+            }
             if let rawActionButtonCount = env["CMUX_UI_TEST_BONSPLIT_ACTION_BUTTON_COUNT"],
                let requestedActionButtonCount = Int(rawActionButtonCount),
                requestedActionButtonCount > 0 {
@@ -11073,8 +12057,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 "workspaceTitle": workspaceTitle,
                 "alphaTitle": alphaTitle,
                 "betaTitle": betaTitle,
+                "gammaTitle": fourTabSetup ? gammaTitle : "",
+                "deltaTitle": fourTabSetup ? deltaTitle : "",
                 "alphaPanelId": alphaPanelId.uuidString,
                 "betaPanelId": betaPanelId.uuidString,
+                "gammaPanelId": gammaPanelId?.uuidString ?? "",
+                "deltaPanelId": deltaPanelId?.uuidString ?? "",
             ])
             self.startBonsplitTabDragUITestRecorder(
                 workspaceId: workspace.id,
@@ -12736,7 +13724,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @discardableResult
     func jumpToLatestUnread(
         excludingNotificationId excludedNotificationId: UUID? = nil,
-        excludingWorkspaceId excludedWorkspaceId: UUID? = nil
+        excludingWorkspaceId excludedWorkspaceId: UUID? = nil,
+        excludingWindowDockTarget excludedWindowDockTarget: WindowDockUnreadTarget? = nil
     ) -> TerminalNotification? {
         guard let notificationStore else { return nil }
 #if DEBUG
@@ -12749,7 +13738,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #endif
         guard let openedId = notificationNavigation.jumpToLatestUnread(
             excludingNotificationId: excludedNotificationId,
-            excludingWorkspaceId: excludedWorkspaceId
+            excludingWorkspaceId: excludedWorkspaceId,
+            excludingWindowDockTarget: excludedWindowDockTarget
         ) else {
             return nil
         }
@@ -13106,9 +14096,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )
     }
 
-    private func handleQuitShortcutWarning() -> Bool {
-        guard activeQuitConfirmationAlertPresenter == nil else { return true }
-        if !QuitConfirmationStore(defaults: .standard).shouldShowConfirmation(
+    private func handleQuitShortcutWarning(
+        onCancel: (() -> Void)? = nil,
+        forceConfirmation: Bool = false
+    ) -> Bool {
+        if let activeQuitConfirmationAlertPresenter {
+            if let onCancel {
+                activeQuitConfirmationAlertPresenter.joinCancellationAction(onCancel)
+            }
+            return true
+        }
+        if !forceConfirmation && !QuitConfirmationStore(defaults: .standard).shouldShowConfirmation(
             isQuitWarningConfirmed: false,
             hasDirtyWorkspaces: hasQuitConfirmationDirtyWorkspaces(),
             isDevBuild: BuildFlavor.current == .dev
@@ -13127,6 +14125,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 // second alert when NSApp.terminate re-enters the delegate callback.
                 self?.isQuitWarningConfirmed = true
                 NSApp.terminate(nil)
+            } else {
+                onCancel?()
             }
         }
         return true
@@ -13645,6 +14645,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if cmuxCloseFocusedTerminalFindForEscape(event: event, appDelegate: self) { return true }
         if handleSimulatorShortcutRouting(event) { return true }
         if matchConfiguredShortcut(event: event, action: .find) {
+            if performFocusedDockShortcut(
+                .startFind,
+                action: .find,
+                event: event
+            ) {
+                return true
+            }
             let shortcutWindow = resolvedShortcutEventWindow(event)
             cmuxRememberFindSelectionBeforePanelFocusMove(tabManager: tabManager, window: shortcutWindow ?? shortcutRoutingKeyWindow); return performFindShortcutInActiveMainWindow(preferredWindow: shortcutWindow)
         }
@@ -13929,9 +14936,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return true
         }
 
+        if matchConfiguredShortcut(event: event, action: .markAllNotificationsRead) {
+            notificationStore?.markAllRead()
+            return true
+        }
+
+        if matchConfiguredShortcut(event: event, action: .clearAllNotifications) {
+            notificationStore?.clearAll()
+            return true
+        }
+
         // Flash the currently focused panel so the user can visually confirm focus.
         if matchConfiguredShortcut(event: event, action: .triggerFlash) {
-            if performFocusedDockShortcut(.triggerFlash, event: event) { return true }
+            if performFocusedDockShortcut(
+                .triggerFlash,
+                action: .triggerFlash,
+                event: event
+            ) {
+                return true
+            }
             let targetManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             targetManager?.triggerFocusFlash()
             return true
@@ -13940,6 +14963,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if handleAdjacentNavigationShortcut(event: event) { return true }
 
         if matchConfiguredShortcut(event: event, action: .toggleTerminalCopyMode) {
+            if performFocusedDockShortcut(
+                .toggleTerminalCopyMode,
+                action: .toggleTerminalCopyMode,
+                event: event
+            ) {
+                return true
+            }
             let handled = tabManager?.toggleFocusedTerminalCopyMode() ?? false
 #if DEBUG
             cmuxDebugLog(
@@ -13953,18 +14983,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .focusTextBoxInput) {
+            if performFocusedDockShortcut(
+                .focusTextBoxInput,
+                action: .focusTextBoxInput,
+                event: event
+            ) {
+                return true
+            }
             let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             let handled = routedManager?.focusFocusedTerminalTextBoxInputOrTerminal() ?? false
             return handled
         }
 
         if matchConfiguredShortcut(event: event, action: .attachTextBoxFile) {
+            if performFocusedDockShortcut(
+                .attachTextBoxFile,
+                action: .attachTextBoxFile,
+                event: event
+            ) {
+                return true
+            }
             let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             let handled = routedManager?.attachFileToFocusedTerminalTextBoxInput() ?? false
             return handled
         }
 
         if matchConfiguredShortcut(event: event, action: .sendCtrlFToTerminal) {
+            if performFocusedDockShortcut(
+                .sendCtrlFToTerminal,
+                action: .sendCtrlFToTerminal,
+                event: event
+            ) {
+                return true
+            }
             let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             let handled = routedManager?.sendCtrlFToFocusedTerminal() ?? false
 #if DEBUG
@@ -13978,6 +15029,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .clearScreenKeepScrollback) {
+            if performFocusedDockShortcut(
+                .clearScreenKeepScrollback,
+                action: .clearScreenKeepScrollback,
+                event: event
+            ) {
+                return true
+            }
             let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             let handled = routedManager?.clearFocusedTerminalKeepingScrollback() ?? false
 #if DEBUG
@@ -14010,6 +15068,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             )
 #endif
             tabManager?.selectPreviousTab()
+            return true
+        }
+
+        if matchConfiguredShortcut(event: event, action: .nextSidebarTabInGroup) {
+#if DEBUG
+            let selected = tabManager?.selectedTabId.map { String($0.uuidString.prefix(5)) } ?? "nil"
+            cmuxDebugLog(
+                "ws.shortcut dir=next scope=group repeat=\(event.isARepeat ? 1 : 0) keyCode=\(event.keyCode) selected=\(selected)"
+            )
+#endif
+            tabManager?.selectNextTab(scope: .focusedGroupMembers)
+            return true
+        }
+
+        if matchConfiguredShortcut(event: event, action: .prevSidebarTabInGroup) {
+#if DEBUG
+            let selected = tabManager?.selectedTabId.map { String($0.uuidString.prefix(5)) } ?? "nil"
+            cmuxDebugLog(
+                "ws.shortcut dir=prev scope=group repeat=\(event.isARepeat ? 1 : 0) keyCode=\(event.keyCode) selected=\(selected)"
+            )
+#endif
+            tabManager?.selectPreviousTab(scope: .focusedGroupMembers)
             return true
         }
 
@@ -14072,6 +15152,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             if let targetWindow = event.window ?? shortcutRoutingActiveWindow,
                targetWindow.identifier?.rawValue == "cmux.settings" {
                 targetWindow.performClose(nil)
+            } else if performFocusedDockShortcut(
+                .closeOtherTabsInPane,
+                action: .closeOtherTabsInPane,
+                event: event
+            ) {
+                return true
             } else {
                 let targetWindow = event.window ?? shortcutRoutingActiveWindow
                 if let terminalContext = focusedTerminalShortcutContext(preferredWindow: targetWindow) {
@@ -14139,6 +15225,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .renameTab) {
+            if performFocusedDockShortcut(
+                .renameSurface(
+                    presentingWindow:
+                        event.window ?? shortcutRoutingActiveWindow
+                ),
+                action: .renameTab,
+                event: event
+            ) {
+                return true
+            }
             let targetWindow = commandPaletteTargetWindow ?? event.window ?? shortcutRoutingActiveWindow
             requestCommandPaletteRenameTab(preferredWindow: targetWindow, source: "shortcut.renameTab")
             return true
@@ -14162,7 +15258,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Numeric shortcuts for surfaces: focused pane in split layout,
         // workspace Canvas order in Canvas layout (9 = last).
         if let digit = routableNumberedConfiguredShortcutDigit(event: event, action: .selectSurfaceByNumber) {
-            if performFocusedDockShortcut(.selectSurface(number: digit), event: event) { return true }
+            if performFocusedDockShortcut(
+                .selectSurface(number: digit),
+                action: .selectSurfaceByNumber,
+                event: event
+            ) {
+                return true
+            }
             let manager = tabManagerForNumberedShortcut(event: event)
             if digit == 9 {
                 manager?.selectLastSurface()
@@ -14179,7 +15281,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             arrowGlyph: "←",
             arrowKeyCode: 123
         ) || matchesGhosttyGotoSplitFallback(event: event, route: .direction(.left)) {
-            if performFocusedDockShortcut(.focusPane(.left), event: event) { return true }
+            if performFocusedDockShortcut(
+                .focusPane(.left),
+                action: .focusLeft,
+                event: event
+            ) {
+                return true
+            }
             let routedTabs = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             cmuxRememberFindSelectionBeforePanelFocusMove(tabManager: routedTabs, window: shortcutRoutingKeyWindow)
             routedTabs?.movePaneFocus(direction: .left)
@@ -14194,7 +15302,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             arrowGlyph: "→",
             arrowKeyCode: 124
         ) || matchesGhosttyGotoSplitFallback(event: event, route: .direction(.right)) {
-            if performFocusedDockShortcut(.focusPane(.right), event: event) { return true }
+            if performFocusedDockShortcut(
+                .focusPane(.right),
+                action: .focusRight,
+                event: event
+            ) {
+                return true
+            }
             let routedTabs = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             cmuxRememberFindSelectionBeforePanelFocusMove(tabManager: routedTabs, window: shortcutRoutingKeyWindow)
             routedTabs?.movePaneFocus(direction: .right)
@@ -14209,7 +15323,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             arrowGlyph: "↑",
             arrowKeyCode: 126
         ) || matchesGhosttyGotoSplitFallback(event: event, route: .direction(.up)) {
-            if performFocusedDockShortcut(.focusPane(.up), event: event) { return true }
+            if performFocusedDockShortcut(
+                .focusPane(.up),
+                action: .focusUp,
+                event: event
+            ) {
+                return true
+            }
             let routedTabs = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             cmuxRememberFindSelectionBeforePanelFocusMove(tabManager: routedTabs, window: shortcutRoutingKeyWindow)
             routedTabs?.movePaneFocus(direction: .up)
@@ -14224,7 +15344,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             arrowGlyph: "↓",
             arrowKeyCode: 125
         ) || matchesGhosttyGotoSplitFallback(event: event, route: .direction(.down)) {
-            if performFocusedDockShortcut(.focusPane(.down), event: event) { return true }
+            if performFocusedDockShortcut(
+                .focusPane(.down),
+                action: .focusDown,
+                event: event
+            ) {
+                return true
+            }
             let routedTabs = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             cmuxRememberFindSelectionBeforePanelFocusMove(tabManager: routedTabs, window: shortcutRoutingKeyWindow)
             routedTabs?.movePaneFocus(direction: .down)
@@ -14242,6 +15368,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Focus Back/Forward keeps ⌘[ / ⌘] on global focus history.
         if matchConfiguredShortcut(event: event, action: .focusPreviousPane) ||
             matchesGhosttyGotoSplitFallback(event: event, route: .previous) {
+            if performFocusedDockShortcut(
+                .cyclePaneFocus(forward: false),
+                action: .focusPreviousPane,
+                event: event
+            ) {
+                return true
+            }
             let routedTabs = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             cmuxRememberFindSelectionBeforePanelFocusMove(tabManager: routedTabs, window: shortcutRoutingKeyWindow)
             let moved = routedTabs?.cyclePaneFocus(forward: false) ?? false
@@ -14259,6 +15392,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         if matchConfiguredShortcut(event: event, action: .focusNextPane) ||
             matchesGhosttyGotoSplitFallback(event: event, route: .next) {
+            if performFocusedDockShortcut(
+                .cyclePaneFocus(forward: true),
+                action: .focusNextPane,
+                event: event
+            ) {
+                return true
+            }
             let routedTabs = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             cmuxRememberFindSelectionBeforePanelFocusMove(tabManager: routedTabs, window: shortcutRoutingKeyWindow)
             let moved = routedTabs?.cyclePaneFocus(forward: true) ?? false
@@ -14275,7 +15415,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .toggleSplitZoom) {
-            if performFocusedDockShortcut(.togglePaneZoom, event: event) { return true }
+            if performFocusedDockShortcut(
+                .togglePaneZoom,
+                action: .toggleSplitZoom,
+                event: event
+            ) {
+                return true
+            }
             let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             performToggleSplitZoomShortcut(tabManager: routedManager)
 #if DEBUG
@@ -14321,20 +15467,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             let routedContext = preferredMainWindowContextForShortcutRouting(event: event)
             let routedTabs = routedContext?.tabManager ?? tabManager
             if let selectedWorkspace = routedTabs?.selectedWorkspace {
-                let accepted =
+                let originatingSurface = resolvedShortcutEventWindow(event)?
+                    .firstResponder
+                    .cmuxStrictOwningGhosttyView()?
+                    .terminalSurface
+                let enqueueOutcome =
                     enqueueWorkspaceTerminalFontSizeChange(
                         workspaceTerminalFontSizeAction,
                         workspace: selectedWorkspace,
                         tabManager: routedTabs,
                         deferFlush: event.isARepeat
                     )
-                if !accepted {
+                switch enqueueOutcome {
+                case .rejected:
                     NSSound.beep()
+                case .acceptedMutation:
+                    // The font mutation fans out across the workspace. Attribute
+                    // the handled input only to the responder that originated it.
+                    originatingSurface?.didReceiveExplicitInput()
+                    originatingSurface?.didAcceptExplicitInput()
+                case .consumedWithoutMutation:
+                    break
                 }
             }
             return true
         }
         if equalizeSplitsMatches && !matchingExplicitActionShouldPreemptEqualizeDefault {
+            if performFocusedDockShortcut(
+                .equalizeSplits,
+                action: .equalizeSplits,
+                event: event
+            ) {
+                return true
+            }
             performEqualizeSplitsShortcut()
             return true
         }
@@ -14358,7 +15523,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             // When the Dock owns keyboard focus, split the focused Dock pane
             // instead of the main area (checked before the transient-focus
             // suppression, which only guards main-terminal states).
-            if routeSplitToFocusedDock(kind: .terminal, direction: .right, preferredWindow: event.window) {
+            if routeSplitToFocusedDock(
+                kind: .terminal,
+                direction: .right,
+                action: .splitRight,
+                preferredWindow: event.window
+            ) {
                 return true
             }
             if shouldSuppressSplitShortcutForTransientTerminalFocusState(direction: .right) {
@@ -14375,7 +15545,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
             cmuxDebugLog("shortcut.action name=splitDown \(debugShortcutRouteSnapshot(event: event))")
 #endif
-            if routeSplitToFocusedDock(kind: .terminal, direction: .down, preferredWindow: event.window) {
+            if routeSplitToFocusedDock(
+                kind: .terminal,
+                direction: .down,
+                action: .splitDown,
+                preferredWindow: event.window
+            ) {
                 return true
             }
             if shouldSuppressSplitShortcutForTransientTerminalFocusState(direction: .down) {
@@ -14392,7 +15567,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
             cmuxDebugLog("shortcut.action name=splitBrowserRight \(debugShortcutRouteSnapshot(event: event))")
 #endif
-            if routeSplitToFocusedDock(kind: .browser, direction: .right, preferredWindow: event.window) {
+            if routeSplitToFocusedDock(
+                kind: .browser,
+                direction: .right,
+                action: .splitBrowserRight,
+                preferredWindow: event.window
+            ) {
                 return true
             }
             _ = performBrowserSplitShortcut(direction: .right)
@@ -14403,28 +15583,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
             cmuxDebugLog("shortcut.action name=splitBrowserDown \(debugShortcutRouteSnapshot(event: event))")
 #endif
-            if routeSplitToFocusedDock(kind: .browser, direction: .down, preferredWindow: event.window) {
+            if routeSplitToFocusedDock(
+                kind: .browser,
+                direction: .down,
+                action: .splitBrowserDown,
+                preferredWindow: event.window
+            ) {
                 return true
             }
             _ = performBrowserSplitShortcut(direction: .down)
             return true
         }
 
-        // Surface navigation (legacy Ctrl+Tab support)
+        // Legacy Ctrl+Tab has no configurable action of its own. It
+        // intentionally reuses nextSurface/prevSurface for Dock ownership so
+        // both strokes follow the same routing classification.
         if matchesLegacyNextSurfaceShortcut(event: event) {
-            if performFocusedDockShortcut(.selectNextSurface, event: event) { return true }
+            if performFocusedDockShortcut(
+                .selectNextSurface,
+                action: .nextSurface,
+                event: event
+            ) {
+                return true
+            }
             (preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager)?.selectNextSurface()
             return true
         }
         if matchesLegacyPreviousSurfaceShortcut(event: event) {
-            if performFocusedDockShortcut(.selectPreviousSurface, event: event) { return true }
+            if performFocusedDockShortcut(
+                .selectPreviousSurface,
+                action: .prevSurface,
+                event: event
+            ) {
+                return true
+            }
             (preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager)?.selectPreviousSurface()
             return true
         }
 
         // New surface: Cmd+T
         if matchConfiguredShortcut(event: event, action: .newSurface) {
-            if routeCreateToFocusedDock(.terminal, focusAddressBar: false, preferredWindow: event.window) != nil {
+            if routeCreateToFocusedDock(
+                .terminal,
+                focusAddressBar: false,
+                action: .newSurface,
+                preferredWindow: event.window
+            ) != nil {
                 return true
             }
             tabManager?.newSurface()
@@ -14433,7 +15637,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         // Open browser: Cmd+Shift+L
         if matchConfiguredShortcut(event: event, action: .openBrowser) {
-            if routeCreateToFocusedDock(.browser, focusAddressBar: true, preferredWindow: event.window) != nil {
+            if routeCreateToFocusedDock(
+                .browser,
+                focusAddressBar: true,
+                action: .openBrowser,
+                preferredWindow: event.window
+            ) != nil {
                 return true
             }
             _ = openBrowserAndFocusAddressBar(insertAtEnd: true)
@@ -14441,7 +15650,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .focusBrowserAddressBar) {
-            if let focusedPanel = tabManager?.focusedBrowserPanel {
+            if let dock = focusedDockStoreForShortcut(
+                action: .focusBrowserAddressBar,
+                preferredWindow: event.window
+            ),
+            let focusedPanelId = dock.focusedPanelId,
+            let focusedBrowser = dock.browserPanel(
+                for: focusedPanelId
+            ) {
+                focusBrowserAddressBar(in: focusedBrowser)
+                return true
+            }
+            let routedManager = preferredMainWindowContextForShortcutRouting(
+                event: event
+            )?.tabManager ?? tabManager
+            if let focusedPanel = routedManager?.focusedWorkspaceBrowserPanel {
                 focusBrowserAddressBar(in: focusedPanel)
                 return true
             }
@@ -14457,7 +15680,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .focusHistoryBack) {
-            if performFocusedDockShortcut(.focusHistoryBack, event: event) { return true }
+            if performFocusedDockShortcut(
+                .focusHistoryBack,
+                action: .focusHistoryBack,
+                event: event
+            ) {
+                return true
+            }
             let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             if routedManager?.navigateBack() != true {
                 NSSound.beep()
@@ -14466,7 +15695,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .focusHistoryForward) {
-            if performFocusedDockShortcut(.focusHistoryForward, event: event) { return true }
+            if performFocusedDockShortcut(
+                .focusHistoryForward,
+                action: .focusHistoryForward,
+                event: event
+            ) {
+                return true
+            }
             let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             if routedManager?.navigateForward() != true {
                 NSSound.beep()
@@ -14552,6 +15787,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .toggleReactGrab) {
+            if performFocusedDockShortcut(
+                .toggleReactGrab,
+                action: .toggleReactGrab,
+                event: event
+            ) {
+                return true
+            }
             let didHandle = tabManager?.toggleReactGrabFromCurrentFocus() ?? false
             if !didHandle { NSSound.beep() }
             return true
@@ -14583,6 +15825,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             guard !shouldLetFocusedBrowserOwnFindShortcut(event) else {
                 return false
             }
+            if performFocusedDockShortcut(
+                .findNext,
+                action: .findNext,
+                event: event
+            ) {
+                return true
+            }
             restoreFocusedMainPanelFocusForShortcut(event: event)
             tabManager?.findNext()
             return true
@@ -14591,6 +15840,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if matchConfiguredShortcut(event: event, action: .findPrevious) {
             guard !shouldLetFocusedBrowserOwnFindShortcut(event) else {
                 return false
+            }
+            if performFocusedDockShortcut(
+                .findPrevious,
+                action: .findPrevious,
+                event: event
+            ) {
+                return true
             }
             restoreFocusedMainPanelFocusForShortcut(event: event)
             tabManager?.findPrevious()
@@ -14601,12 +15857,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             guard !shouldLetFocusedBrowserOwnFindShortcut(event) else {
                 return false
             }
+            if performFocusedDockShortcut(
+                .hideFind,
+                action: .hideFind,
+                event: event
+            ) {
+                return true
+            }
             restoreFocusedMainPanelFocusForShortcut(event: event)
             tabManager?.hideFind()
             return true
         }
 
         if matchConfiguredShortcut(event: event, action: .useSelectionForFind) {
+            if performFocusedDockShortcut(
+                .useSelectionForFind,
+                action: .useSelectionForFind,
+                event: event
+            ) {
+                return true
+            }
             restoreFocusedMainPanelFocusForShortcut(event: event)
             tabManager?.searchSelection()
             return true
@@ -14626,6 +15896,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if matchConfiguredShortcut(event: event, action: .reopenClosedBrowserPanel) {
+            if performFocusedDockShortcut(
+                .reopenClosedPanel,
+                action: .reopenClosedBrowserPanel,
+                event: event
+            ) {
+                return true
+            }
             let routedManager = preferredMainWindowContextForShortcutRouting(event: event)?.tabManager ?? tabManager
             _ = reopenMostRecentlyClosedItem(preferredTabManager: routedManager)
             return true
@@ -14639,9 +15916,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         workspace: Workspace,
         tabManager: TabManager?,
         deferFlush: Bool
-    ) -> Bool {
+    ) -> WorkspaceTerminalFontSizeShortcutOutcome {
         if action == .resetWorkspaceTerminalFontSize, deferFlush {
-            return true
+            return .consumedWithoutMutation
         }
         let change: WorkspaceTerminalFontSizeChange
         if action == .resetWorkspaceTerminalFontSize {
@@ -14653,20 +15930,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
         guard let tabManager,
               let context = mainWindowContext(for: tabManager) else {
-            return true
+            return .consumedWithoutMutation
         }
 #if DEBUG
         if let override =
                 context
                     .debugWorkspaceTerminalFontSizeEnqueueResultOverride {
-            return override
+            return override ? .acceptedMutation : .rejected
         }
 #endif
-        return context.workspaceTerminalFontSizeCoordinator.enqueue(
+        let accepted = context.workspaceTerminalFontSizeCoordinator.enqueue(
             change,
             workspaceId: workspace.id,
             deferFlush: deferFlush
         )
+        return accepted ? .acceptedMutation : .rejected
     }
 
 
@@ -14794,8 +16072,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             "workspace=\(workspace.id.uuidString.prefix(5)) focusedAfter=\(focusedAfter)"
         )
 #endif
-        focusBrowserAddressBar(in: panel)
-        return true
+        return focusBrowserAddressBar(in: panel)
     }
 
     @discardableResult
@@ -14864,15 +16141,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )?.id
     }
 
-    func focusBrowserAddressBar(in panel: BrowserPanel) {
+    @discardableResult
+    func focusBrowserAddressBar(in panel: BrowserPanel) -> Bool {
+        guard let requestId = panel.requestAddressBarFocus(
+            selectionIntent: .selectAll
+        ) else {
+            if browserAddressBarFocusedPanelId == panel.id {
+                browserAddressBarFocusedPanelId = nil
+            }
 #if DEBUG
-        let requestId = panel.requestAddressBarFocus(selectionIntent: .selectAll)
+            cmuxDebugLog(
+                "browser.focus.addressBar.request panel=\(panel.id.uuidString.prefix(5)) " +
+                "result=chromeless \(browserFocusStateSnapshot())"
+            )
+#endif
+            return false
+        }
+#if DEBUG
         cmuxDebugLog(
             "browser.focus.addressBar.request panel=\(panel.id.uuidString.prefix(5)) " +
             "request=\(requestId.uuidString.prefix(8)) \(browserFocusStateSnapshot())"
         )
-#else
-        _ = panel.requestAddressBarFocus(selectionIntent: .selectAll)
 #endif
         browserAddressBarFocusedPanelId = panel.id
 #if DEBUG
@@ -14888,6 +16177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             "request=\(requestId.uuidString.prefix(8))"
         )
 #endif
+        return true
     }
 
     func focusedBrowserAddressBarPanelId() -> UUID? {
@@ -14930,21 +16220,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let intentPanelId = browserAddressBarIntentPanelId(in: context, window: shortcutWindow)
         guard let panelId = responderPanelId ?? browserAddressBarFocusedPanelId ?? intentPanelId else { return nil }
 
-        guard let workspace = context.tabManager.selectedWorkspace else {
+        guard let panel = browserAddressBarShortcutPanel(
+            panelId: panelId,
+            in: context
+        ) else {
 #if DEBUG
             cmuxDebugLog(
                 "browser.focus.addressBar.shortcutContext panel=\(panelId.uuidString.prefix(5)) " +
-                "accepted=0 reason=no_workspace event=\(NSWindow.keyDescription(event))"
-            )
-#endif
-            return nil
-        }
-
-        guard let panel = workspace.browserPanel(for: panelId) else {
-#if DEBUG
-            cmuxDebugLog(
-                "browser.focus.addressBar.shortcutContext panel=\(panelId.uuidString.prefix(5)) " +
-                "accepted=0 reason=panel_not_in_workspace workspace=\(workspace.id.uuidString.prefix(5)) " +
+                "accepted=0 reason=panel_not_in_active_host " +
+                "host=\(browserAddressBarShortcutHostDescription(in: context)) " +
                 "event=\(NSWindow.keyDescription(event))"
             )
 #endif
@@ -14955,7 +16239,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
             cmuxDebugLog(
                 "browser.focus.addressBar.shortcutContext panel=\(responderPanelId.uuidString.prefix(5)) " +
-                "accepted=1 reason=omnibar_responder workspace=\(workspace.id.uuidString.prefix(5)) " +
+                "accepted=1 reason=omnibar_responder " +
+                "host=\(browserAddressBarShortcutHostDescription(in: context)) " +
                 "event=\(NSWindow.keyDescription(event))"
             )
 #endif
@@ -14966,7 +16251,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
             cmuxDebugLog(
                 "browser.focus.addressBar.shortcutContext panel=\(panelId.uuidString.prefix(5)) " +
-                "accepted=1 reason=addressbar_intent workspace=\(workspace.id.uuidString.prefix(5)) " +
+                "accepted=1 reason=addressbar_intent " +
+                "host=\(browserAddressBarShortcutHostDescription(in: context)) " +
                 "event=\(NSWindow.keyDescription(event))"
             )
 #endif
@@ -14987,7 +16273,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
             cmuxDebugLog(
                 "browser.focus.addressBar.shortcutContext panel=\(panelId.uuidString.prefix(5)) " +
-                "accepted=1 reason=tracked_omnibar_field workspace=\(workspace.id.uuidString.prefix(5)) " +
+                "accepted=1 reason=tracked_omnibar_field " +
+                "host=\(browserAddressBarShortcutHostDescription(in: context)) " +
                 "event=\(NSWindow.keyDescription(event))"
             )
 #endif
@@ -15003,7 +16290,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #if DEBUG
             cmuxDebugLog(
                 "browser.focus.addressBar.shortcutContext panel=\(panelId.uuidString.prefix(5)) " +
-                "accepted=1 reason=transient_omnibar_focus workspace=\(workspace.id.uuidString.prefix(5)) " +
+                "accepted=1 reason=transient_omnibar_focus " +
+                "host=\(browserAddressBarShortcutHostDescription(in: context)) " +
                 "event=\(NSWindow.keyDescription(event))"
             )
 #endif
@@ -15011,11 +16299,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
 #if DEBUG
-        let focusedPanel = workspace.focusedPanelId.map { String($0.uuidString.prefix(5)) } ?? "nil"
+        let focusedPanel = browserAddressBarShortcutFocusedPanelId(in: context)
+            .map { String($0.uuidString.prefix(5)) } ?? "nil"
         cmuxDebugLog(
             "browser.focus.addressBar.shortcutContext panel=\(panelId.uuidString.prefix(5)) " +
             "accepted=0 reason=responder_not_omnibar responder=\(shortcutResponder.map { String(describing: type(of: $0)) } ?? "nil") " +
             "pending=\(panel.pendingAddressBarFocusRequestId != nil ? 1 : 0) focusedPanel=\(focusedPanel) " +
+            "host=\(browserAddressBarShortcutHostDescription(in: context)) " +
             "event=\(NSWindow.keyDescription(event))"
         )
 #endif
@@ -15062,9 +16352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         in context: MainWindowContext,
         window: NSWindow?
     ) -> UUID? {
-        guard let workspace = context.tabManager.selectedWorkspace,
-              let focusedPanelId = workspace.focusedPanelId,
-              let panel = workspace.browserPanel(for: focusedPanelId),
+        guard let panel = focusedBrowserAddressBarShortcutPanel(in: context),
               panel.preferredFocusIntent == .addressBar,
               let field = browserOmnibarField(panelId: panel.id, in: window) else {
             return nil
@@ -15074,6 +16362,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return nil
         }
         return panel.id
+    }
+
+    private func browserAddressBarShortcutPanel(
+        panelId: UUID,
+        in context: MainWindowContext
+    ) -> BrowserPanel? {
+        if let mode = context.keyboardFocusCoordinator.activeRightSidebarMode {
+            guard mode == .dock else { return nil }
+            return existingWindowDock(forWindowId: context.windowId)?
+                .browserPanel(for: panelId)
+        }
+        return context.tabManager.selectedWorkspace?
+            .browserPanel(for: panelId)
+    }
+
+    private func focusedBrowserAddressBarShortcutPanel(
+        in context: MainWindowContext
+    ) -> BrowserPanel? {
+        guard let panelId = browserAddressBarShortcutFocusedPanelId(
+            in: context
+        ) else {
+            return nil
+        }
+        return browserAddressBarShortcutPanel(
+            panelId: panelId,
+            in: context
+        )
+    }
+
+    private func browserAddressBarShortcutFocusedPanelId(
+        in context: MainWindowContext
+    ) -> UUID? {
+        if let mode = context.keyboardFocusCoordinator.activeRightSidebarMode {
+            guard mode == .dock else { return nil }
+            return existingWindowDock(forWindowId: context.windowId)?
+                .focusedPanelId
+        }
+        return context.tabManager.selectedWorkspace?.focusedPanelId
+    }
+
+    private func browserAddressBarShortcutHostDescription(
+        in context: MainWindowContext
+    ) -> String {
+        if let mode = context.keyboardFocusCoordinator.activeRightSidebarMode {
+            if mode == .dock {
+                return "windowDock=\(context.windowId.uuidString.prefix(5))"
+            }
+            return "rightSidebar=\(mode.rawValue)"
+        }
+        let workspaceId = context.tabManager.selectedWorkspace?.id
+            .uuidString.prefix(5) ?? "nil"
+        return "workspace=\(workspaceId)"
     }
 
     private func browserPanel(
@@ -15361,6 +16701,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @discardableResult
     func handleBrowserSurfaceKeyEquivalentBeforeMainMenu(_ event: NSEvent) -> Bool {
         if matchConfiguredShortcut(event: event, action: .find) {
+            if performFocusedDockShortcut(
+                .startFind,
+                action: .find,
+                event: event
+            ) {
+                return true
+            }
             let shortcutWindow = resolvedShortcutEventWindow(event)
             cmuxRememberFindSelectionBeforePanelFocusMove(tabManager: tabManager, window: shortcutWindow ?? shortcutRoutingKeyWindow); return performFindShortcutInActiveMainWindow(preferredWindow: shortcutWindow)
         }
@@ -15434,7 +16781,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         // Match the workspace context-menu eligibility filter so the shortcut
         // doesn't silently create an anchor-only group when every selected
         // target is already an existing group's anchor.
-        let existingAnchorIds = Set(tabManager.workspaceGroups.map(\.anchorWorkspaceId))
+        let existingAnchorIds = Set(tabManager.workspaceGroups.compactMap(\.liveAnchorWorkspaceId))
         let eligibleIds: [UUID] = candidateIds.filter { id in
             tabManager.tabs.contains(where: { $0.id == id }) && !existingAnchorIds.contains(id)
         }
@@ -15805,7 +17152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard let context = mainWindowContexts.values.first(where: { $0.tabManager === tabManager }) else {
             return false
         }
-        let anchorId = tabManager.workspaceGroups.first { $0.id == groupId }?.anchorWorkspaceId
+        let anchorId = tabManager.workspaceGroups.first { $0.id == groupId }?.liveAnchorWorkspaceId
         let groupPlacement: WorkspaceGroupNewPlacement = {
             let cwd = anchorId.flatMap { id in
                 tabManager.tabs.first(where: { $0.id == id })?.currentDirectory
@@ -15930,7 +17277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         case .builtIn(let builtIn):
             switch builtIn {
             case .newWorkspace:
-                context.tabManager.addWorkspace()
+                guard context.tabManager.addWorkspaceIfActive() != nil else { return false }
                 onExecuted?()
                 return true
             case .newAgentChat: return performConfiguredNewAgentChatAction(context: context, preferredWindow: preferredWindow, onExecuted: onExecuted)
@@ -16591,10 +17938,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
-    private func browserPanel(for panelId: UUID) -> BrowserPanel? {
-        return workspaceContainingPanel(panelId: panelId)?.workspace.browserPanel(for: panelId)
-    }
-
     func browserFindBarIsVisible(for webView: CmuxWebView) -> Bool {
         browserPanelOwning(webView)?.searchState != nil
     }
@@ -16658,51 +18001,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func browserPanelOwning(_ webView: CmuxWebView) -> BrowserPanel? {
-        var candidateManagers: [TabManager] = []
-        var seenManagers = Set<ObjectIdentifier>()
-
-        func appendCandidate(_ manager: TabManager?) {
-            guard let manager else { return }
-            let identifier = ObjectIdentifier(manager)
-            guard seenManagers.insert(identifier).inserted else { return }
-            candidateManagers.append(manager)
-        }
-
-        if let window = webView.window,
-           let context = contextForMainWindow(window) {
-            appendCandidate(context.tabManager)
-        }
-        appendCandidate(tabManager)
-        for context in mainWindowContexts.values {
-            appendCandidate(context.tabManager)
-        }
-
-        for manager in candidateManagers {
-            if let panel = browserPanelOwning(webView, in: manager) {
-                return panel
-            }
-        }
-        return nil
-    }
-
-    private func browserPanelOwning(_ webView: CmuxWebView, in manager: TabManager) -> BrowserPanel? {
-        for workspace in manager.tabs {
-            if let panel = workspace.panels.values
-                .compactMap({ $0 as? BrowserPanel })
-                .first(where: { $0.webView === webView }) {
-                return panel
-            }
-        }
-        return nil
+        browserPanel(owning: webView)
     }
 
     private func activateMainWindowContext(_ context: MainWindowContext?) {
+        let priorOwner = tabManager
         guard let context else {
             tabManager = nil
             sidebarState = nil
             sidebarSelectionState = nil
             fileExplorerState = nil
             TerminalController.shared.setActiveTabManager(nil)
+            if let priorOwner {
+                finalizeRejectedMainWindowRegistrationIfUnowned(priorOwner)
+            }
             return
         }
         tabManager = context.tabManager
@@ -16710,6 +18022,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         sidebarSelectionState = context.sidebarSelectionState
         fileExplorerState = context.fileExplorerState
         TerminalController.shared.setActiveTabManager(context.tabManager)
+        if let priorOwner, priorOwner !== context.tabManager {
+            finalizeRejectedMainWindowRegistrationIfUnowned(priorOwner)
+        }
     }
 
     func setActiveMainWindow(_ window: NSWindow) {
@@ -16725,56 +18040,234 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 #endif
     }
 
-    private func handleMainTerminalWindowShouldClose() -> Bool {
+    private func handleMainTerminalWindowShouldClose(
+        _ candidateWindow: NSWindow,
+        onCancel: (() -> Void)?
+    ) -> Bool {
         // XCTest has no UI for the warn-before-quit dialog and would either block
         // on runModal or have NSApp.terminate kill the test process.
         if isRunningUnderXCTest(ProcessInfo.processInfo.environment) { return true }
-        guard !isTerminatingApp, mainWindowContexts.count <= 1 else { return true }
-        _ = handleQuitShortcutWarning()
+        guard !isTerminatingApp else { return true }
+
+        // AppKit may deliver windowShouldClose again after the close has already
+        // committed and the exact window has relinquished its route. Never let
+        // that stale callback stand in for the surviving owner.
+        guard !hasCommittedMainWindowClose(candidateWindow) else { return true }
+
+        let authoritativeRoutes = mainWindowSessionPersistenceRoutes()
+        guard authoritativeRoutes.count == 1,
+              authoritativeRoutes[0].window === candidateWindow else {
+            return true
+        }
+
+        // The "Don't warn again for Cmd+Q" preference does not apply here:
+        // Ctrl+D has already exited the sole shell, so this decision must offer
+        // Cancel as the only way to recover a terminal instead of quitting cmux.
+        _ = handleQuitShortcutWarning(
+            onCancel: onCancel,
+            forceConfirmation: onCancel != nil
+        )
         return false
     }
 
+    private func handleMainTerminalWindowCloseRequest(
+        _ candidateWindow: NSWindow,
+        windowId: UUID,
+        onCancel: (() -> Void)?
+    ) -> Bool {
+        let cancellationAction: (() -> Void)? = onCancel.map { action in
+            { [weak self] in
+                self?.handleCancelledMainTerminalWindowClose(windowId: windowId)
+                action()
+            }
+        }
+        let shouldClose = handleMainTerminalWindowShouldClose(
+            candidateWindow,
+            onCancel: cancellationAction
+        )
+        if !shouldClose, onCancel == nil {
+            handleCancelledMainTerminalWindowClose(windowId: windowId)
+        }
+        return shouldClose
+    }
+
+    private func handleCancelledMainTerminalWindowClose(windowId: UUID) {
+        closedWindowHistorySuppressedWindowIds.remove(windowId)
+        // A cancelled close must not leave an explicit kill-on-close marker for
+        // a later window or app close. A confirmed quit keeps the marker so
+        // applicationWillTerminate kills the remote session before exit.
+        if !isTerminatingApp {
+            remoteTmuxController.consumeKillSessionsOnWindowClose(windowId: windowId)
+        }
+    }
+
     private func unregisterMainWindow(_ window: NSWindow) {
+        commitMainWindowClose(window)
+    }
+
+    func hasCommittedMainWindowClose(_ window: NSWindow) -> Bool {
+        mainWindowVisibilityController.hasCommittedClose(for: window)
+    }
+
+    @discardableResult
+    func commitMainWindowClose(_ window: NSWindow) -> Bool {
+        // Tombstone before touching snapshots or surfaces. SwiftUI can invoke
+        // its window accessor during teardown, and registration must observe
+        // the close as committed even if AppKit retains the NSWindow object.
+        mainWindowVisibilityController.commitClose(window)
+        // A close signal owns only the exact NSWindow identity that emitted it.
+        // Matching by window id here can tear down the live owner when SwiftUI
+        // closes an ignored duplicate carrying the same restored identifier.
+        if let context = mainWindowContext(forExactWindowIdentity: window) {
+            return commitMainWindowClose(context: context, window: window)
+        }
+        guard let windowId = mainWindowId(from: window),
+              let route = recoverableMainWindowRoute(windowId: windowId),
+              let cachedWindow = route.window,
+              cachedWindow === window,
+              NSApp.windows.contains(where: { $0 === cachedWindow }),
+              mainWindowId(from: cachedWindow) == windowId,
+              let manager = route.tabManager else {
+            return false
+        }
+        route.window = window
+        return commitMainWindowClose(
+            windowId: windowId,
+            tabManager: manager,
+            context: nil,
+            window: window
+        )
+    }
+
+    @discardableResult
+    private func commitMainWindowClose(
+        context: MainWindowContext,
+        window: NSWindow?
+    ) -> Bool {
+        commitMainWindowClose(
+            windowId: context.windowId,
+            tabManager: context.tabManager,
+            context: context,
+            window: window
+        )
+    }
+
+    @discardableResult
+    private func commitMainWindowClose(
+        windowId: UUID,
+        tabManager closingTabManager: TabManager,
+        context: MainWindowContext?,
+        window: NSWindow?
+    ) -> Bool {
+        let recoverableRoute: RecoverableMainWindowRoute?
+        if let context {
+            guard mainWindowContexts.values.contains(where: { $0 === context }) else {
+                return false
+            }
+            recoverableRoute = nil
+        } else {
+            guard let route = recoverableMainWindowRoute(windowId: windowId),
+                  route.tabManager === closingTabManager else {
+                return false
+            }
+            recoverableRoute = route
+        }
+
         // Reset cascade point so the next new window appears near the closing
         // window's position, matching upstream Ghostty behavior.
-        let frame = window.frame
-        lastCascadePoint = NSPoint(x: frame.minX, y: frame.maxY)
-        let closingContext = contextForMainTerminalWindow(window, reindex: false)
-        let closingWindowIsCrashDiagnostic = closingContext.map { context in
-            closeWindowSnapshotPruningCrashDiagnostics(
+        if let window {
+            let frame = window.frame
+            lastCascadePoint = NSPoint(x: frame.minX, y: frame.maxY)
+        }
+        let restorableAgentIndex =
+            SharedLiveAgentIndex.shared.currentIndexSchedulingRefresh() ?? .empty
+        let closingWindowIsCrashDiagnostic: Bool
+        if let context {
+            closingWindowIsCrashDiagnostic = closeWindowSnapshotPruningCrashDiagnostics(
                 for: context,
                 includeScrollback: false,
-                restorableAgentIndex: SharedLiveAgentIndex.shared.currentIndexSchedulingRefresh() ?? .empty
-            )
-                .isCrashDiagnostic
-        } ?? false
+                restorableAgentIndex: restorableAgentIndex
+            ).isCrashDiagnostic
+        } else if let recoverableRoute {
+            closingWindowIsCrashDiagnostic = closeWindowSnapshotPruningCrashDiagnostics(
+                windowId: windowId,
+                tabManager: closingTabManager,
+                window: window,
+                sidebarSnapshot: recoverableRoute.sidebarSnapshot,
+                includeScrollback: false,
+                restorableAgentIndex: restorableAgentIndex
+            ).isCrashDiagnostic
+        } else {
+            closingWindowIsCrashDiagnostic = false
+        }
 
-        if let closingContext, !closingWindowIsCrashDiagnostic {
-            recordClosedWindowHistoryIfNeeded(for: closingContext)
+        if !closingWindowIsCrashDiagnostic {
+            if let context {
+                recordClosedWindowHistoryIfNeeded(for: context)
+            } else if let recoverableRoute {
+                recordClosedWindowHistoryIfNeeded(
+                    windowId: windowId,
+                    tabManager: closingTabManager,
+                    window: window,
+                    sidebarSnapshot: recoverableRoute.sidebarSnapshot
+                )
+            }
+        } else {
+            closedWindowHistorySuppressedWindowIds.remove(windowId)
         }
 
         // Keep geometry available as a fallback for the next window placement,
         // and remember the closing frame for the current configuration.
-        if !isTerminatingApp {
+        if !isTerminatingApp, let window {
             captureWindowConfigFrame(window, reason: "windowClose")
             persistWindowGeometry(from: window)
         }
-        mainWindowVisibilityController.discardClosedWindow(window)
 
-        guard let removed = unregisterMainWindowContext(for: window) else { return }
-        windowConfigFrames.removeValue(forKey: removed.windowId)
-        publishCmuxWindowLifecycle(name: "window.closed", windowId: removed.windowId, origin: "appkit_close")
-        commandPaletteWindowStore.removeWindow(removed.windowId)
+        // First commit removal of the exact authoritative route. A synchronous
+        // teardown callback may already have removed it; in that case no
+        // manager-owned resource may be finalized by this stale transaction.
+        if let context {
+            guard removeMainWindowContext(context, rememberRecoverableRoute: false) != nil else {
+                return false
+            }
+        } else {
+            forgetRecoverableMainWindowRoute(windowId: windowId)
+            notifyMainWindowContextsDidChange()
+        }
+
+        let closingWorkspaces = Array(closingTabManager.tabs)
+        let closingWorkspaceIds = closingWorkspaces.map(\.id)
+        // An explicit close of a window's final remote workspace kills the
+        // marked session. Every other window close detaches and preserves it.
+        if remoteTmuxController.consumeKillSessionsOnWindowClose(windowId: windowId) {
+            for workspace in closingWorkspaces where workspace.isRemoteTmuxMirror {
+                remoteTmuxController.handleWorkspaceClosed(workspaceId: workspace.id)
+            }
+        }
+        remoteTmuxController.handleWindowWorkspacesClosed(workspaceIds: closingWorkspaceIds)
+
+        // Route removal committed this close rather than a temporary routing
+        // loss. Retire every retained model only after that authority check, so
+        // no callback can partially finalize an owner whose close lost a race.
+        closingTabManager.finalizeAllWorkspacesForWindowClose()
+        closingTabManager.window = nil
+        // The controller's windowWillClose callback owns releasing the retained
+        // AppKit/SwiftUI graph and then removes itself from this array. A
+        // WindowCloseObserver can arrive first, so removing the controller here
+        // would race and skip that release transaction.
+        windowConfigFrames.removeValue(forKey: windowId)
+        publishCmuxWindowLifecycle(name: "window.closed", windowId: windowId, origin: "appkit_close")
+        commandPaletteWindowStore.removeWindow(windowId)
 
         // Avoid stale notifications that can no longer be opened once the owning window is gone.
         if let store = notificationStore {
-            store.clearNotifications(forTabId: removed.windowId)
-            for tab in removed.tabManager.tabs {
+            store.clearNotifications(forTabId: windowId)
+            for tab in closingWorkspaces {
                 store.clearNotifications(forTabId: tab.id)
             }
         }
 
-        if tabManager === removed.tabManager {
+        if tabManager === closingTabManager {
             // Repoint "active" pointers to any remaining main terminal window.
             let nextContext: MainWindowContext? = {
                 if let keyWindow = shortcutRoutingKeyWindow,
@@ -16797,6 +18290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 preserveManualRestoreBackupOnMissingPrimary: closingWindowIsCrashDiagnostic
             )
         }
+        return true
     }
 
     private func closeWindowSnapshotPruningCrashDiagnostics(
@@ -16804,8 +18298,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         includeScrollback: Bool,
         restorableAgentIndex: RestorableAgentSessionIndex
     ) -> (snapshot: SessionWindowSnapshot?, isCrashDiagnostic: Bool) {
+        closeWindowSnapshotPruningCrashDiagnostics(
+            windowId: context.windowId,
+            tabManager: context.tabManager,
+            window: context.window ?? windowForMainWindowId(context.windowId),
+            sidebarSnapshot: sessionSidebarSnapshot(for: context),
+            includeScrollback: includeScrollback,
+            restorableAgentIndex: restorableAgentIndex
+        )
+    }
+
+    private func closeWindowSnapshotPruningCrashDiagnostics(
+        windowId: UUID,
+        tabManager: TabManager,
+        window: NSWindow?,
+        sidebarSnapshot: SessionSidebarSnapshot,
+        includeScrollback: Bool,
+        restorableAgentIndex: RestorableAgentSessionIndex
+    ) -> (snapshot: SessionWindowSnapshot?, isCrashDiagnostic: Bool) {
         let windowSnapshot = sessionWindowSnapshot(
-            for: context,
+            windowId: windowId,
+            tabManager: tabManager,
+            window: window,
+            sidebarSnapshot: sidebarSnapshot,
             includeScrollback: includeScrollback,
             restorableAgentIndex: restorableAgentIndex
         )
@@ -16823,7 +18338,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func recordClosedWindowHistoryIfNeeded(for context: MainWindowContext) {
-        let shouldSuppressClosedWindowHistory = closedWindowHistorySuppressedWindowIds.remove(context.windowId) != nil
+        recordClosedWindowHistoryIfNeeded(
+            windowId: context.windowId,
+            tabManager: context.tabManager,
+            window: context.window ?? windowForMainWindowId(context.windowId),
+            sidebarSnapshot: sessionSidebarSnapshot(for: context)
+        )
+    }
+
+    private func recordClosedWindowHistoryIfNeeded(
+        windowId: UUID,
+        tabManager: TabManager,
+        window: NSWindow?,
+        sidebarSnapshot: SessionSidebarSnapshot
+    ) {
+        let shouldSuppressClosedWindowHistory = closedWindowHistorySuppressedWindowIds.remove(windowId) != nil
         guard !shouldSuppressClosedWindowHistory,
               !isTerminatingApp,
               !isApplyingSessionRestore else {
@@ -16832,7 +18361,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let restorableAgentIndex = SharedLiveAgentIndex.shared.currentIndexSchedulingRefresh()
             ?? RestorableAgentSessionIndex.load()
         guard let snapshot = closeWindowSnapshotPruningCrashDiagnostics(
-            for: context,
+            windowId: windowId,
+            tabManager: tabManager,
+            window: window,
+            sidebarSnapshot: sidebarSnapshot,
             includeScrollback: true,
             restorableAgentIndex: restorableAgentIndex
         ).snapshot else {
@@ -16842,7 +18374,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             return
         }
         ClosedItemHistoryStore.shared.push(.window(ClosedWindowHistoryEntry(
-            windowId: context.windowId,
+            windowId: windowId,
             snapshot: snapshot,
             workspaceIds: snapshot.tabManager.workspaces.compactMap(\.workspaceId)
         )))
@@ -16881,23 +18413,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         workspaceForMainActor(tabId: tabId)
     }
 
-    func closeMainWindowContainingTabId(_ tabId: UUID, recordHistory: Bool = true) {
+    func closeMainWindowContainingTabId(
+        _ tabId: UUID,
+        recordHistory: Bool = true,
+        onCancelled: (() -> Void)? = nil
+    ) {
 #if DEBUG
         closeMainWindowContainingTabIdObserverForTesting?(tabId, recordHistory)
 #endif
-        guard let context = contextContainingTabId(tabId) else { return }
-        let expectedIdentifier = "cmux.main.\(context.windowId.uuidString)"
-        let window: NSWindow? = context.window ?? NSApp.windows.first(where: { $0.identifier?.rawValue == expectedIdentifier })
-        if !recordHistory {
-            closedWindowHistorySuppressedWindowIds.insert(context.windowId)
-        }
-        guard let window else {
+        func closeOwnedRoute(
+            windowId: UUID,
+            exactWindow: NSWindow?,
+            commitWindowlessClose: () -> Bool
+        ) {
             if !recordHistory {
-                closedWindowHistorySuppressedWindowIds.remove(context.windowId)
+                closedWindowHistorySuppressedWindowIds.insert(windowId)
             }
+            if let exactWindow,
+               NSApp.windows.contains(where: { $0 === exactWindow }) {
+                if let onCancelled,
+                   !handleMainTerminalWindowCloseRequest(
+                       exactWindow,
+                       windowId: windowId,
+                       onCancel: onCancelled
+                   ) {
+                    return
+                }
+                exactWindow.performClose(nil)
+                if !recordHistory,
+                   !hasCommittedMainWindowClose(exactWindow) {
+                    closedWindowHistorySuppressedWindowIds.remove(windowId)
+                }
+                return
+            }
+            let didCommit = commitWindowlessClose()
+            if !didCommit, !recordHistory {
+                closedWindowHistorySuppressedWindowIds.remove(windowId)
+            }
+        }
+
+        if let context = contextContainingTabId(tabId) {
+            closeOwnedRoute(
+                windowId: context.windowId,
+                exactWindow: context.window,
+                commitWindowlessClose: {
+                    commitMainWindowClose(context: context, window: nil)
+                }
+            )
             return
         }
-        window.performClose(nil)
+        guard let route = recoverableMainWindowRouteContainingTabId(tabId),
+              let manager = route.tabManager else {
+            return
+        }
+        closeOwnedRoute(
+            windowId: route.windowId,
+            exactWindow: route.window,
+            commitWindowlessClose: {
+                commitMainWindowClose(
+                    windowId: route.windowId,
+                    tabManager: manager,
+                    context: nil,
+                    window: nil
+                )
+            }
+        )
     }
 
     @discardableResult
@@ -17532,12 +19112,20 @@ private extension NSWindow {
             return true
         }
         let browserWebKitKeyDownReentry = firstResponderWebView != nil && cmuxBrowserWebKitKeyDownDispatchIsActive()
-        if shortcutRoutingShouldBypassForPrintableOptionText(event: event) {
+        let shouldBypassPrintableOptionText = shortcutRoutingShouldBypassForPrintableOptionText(event: event)
+        // AppKit can send Option-only keys through a text/terminal fast path
+        // before the normal menu route. Give the shared configured-shortcut
+        // dispatcher first ownership for every Option-only event; an unmatched
+        // printable event still takes the text-input branch below.
+        if ShortcutRoutingPolicy.isOptionOnly(event),
+           !browserWebKitKeyDownReentry,
+           !firstResponderHasMarkedText,
+           !(firstResponderGhosttyView?.hasMarkedText() ?? false),
+           AppDelegate.shared?.handleConfiguredShortcutKeyEquivalent(event) == true {
+            return true
+        }
+        if shouldBypassPrintableOptionText {
             if browserWebKitKeyDownReentry { return false }
-            if !firstResponderHasMarkedText,
-               AppDelegate.shared?.handleConfiguredShortcutKeyEquivalent(event) == true {
-                return true
-            }
             let textInputTarget: NSResponder? = firstResponderGhosttyView
                 ?? firstResponderWebView
                 ?? self.firstResponder
@@ -18227,7 +19815,7 @@ extension AppDelegate: UpdateActionDelegate, UpdateActionsHost {
 
     func updaterWillRelaunchApplication() {
         persistSessionForUpdateRelaunch()
-        TerminalController.shared.stop()
+        TerminalController.shared.stop(cleanupDiscoveryState: true)
         NSApp.invalidateRestorableState()
         for window in NSApp.windows {
             window.invalidateRestorableState()
@@ -18236,6 +19824,13 @@ extension AppDelegate: UpdateActionDelegate, UpdateActionsHost {
 
     func attemptUpdate() {
         attemptUpdate(nil)
+    }
+
+    func copyUpdateDetails(_ text: String) -> Bool {
+        GhosttyApp.terminalPasteboard.writeString(
+            text,
+            to: .general
+        )
     }
 
     var updateLogPath: String {

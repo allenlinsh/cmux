@@ -25,6 +25,11 @@ export const projects = {
 export const requiredRuntimeEnvKeys = [
   "AWS_REGION",
   "AWS_ROLE_ARN",
+  // The application can build without APNs credentials, but a promoted
+  // runtime cannot deliver the Push Alerts feature without the complete set.
+  "CMUX_APNS_KEY_ID",
+  "CMUX_APNS_KEY_P8",
+  "CMUX_APNS_TEAM_ID",
   "CMUX_DB_DRIVER",
   "CMUX_VM_CREATE_ENABLED",
   "CMUX_VM_DEFAULT_PROVIDER",
@@ -140,6 +145,8 @@ export function requireEnvKeys(env, keys, label) {
 
 export function runVercel(args, options = {}) {
   const stdio = options.stdio ?? "inherit";
+  // The Vercel CLI reads VERCEL_TOKEN from the environment, so CI needs no
+  // --token in argv (argv leaks into process listings and thrown errors).
   const env = { ...process.env, ...options.env };
   const command = process.env.VERCEL_CLI;
   if (command) return execFileSync(command, args, { ...options, env, stdio });

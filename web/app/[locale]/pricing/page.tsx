@@ -27,16 +27,13 @@ import {
   FeatureList,
   PlanCard,
   PricingCompareTable,
-  PricingSizeTable,
   PrimaryLink,
   SecondaryLink,
   visibleCompareRows,
   visibleFaqItems,
   visibleProFeatures,
-  SHOW_VAULT,
   type CompareRow,
   type FaqItem,
-  type SizeRow,
 } from "../../components/pricing-shared";
 import {
   PricingCheckoutButton,
@@ -49,11 +46,12 @@ import {
   TEAM_PRICING_USD,
   proBillingInterval,
 } from "../../../services/billing/plans";
+import { isVaultEnabled } from "../../../services/vault/config";
 
 const ENTERPRISE_CTA_URL = "/enterprise";
 const ANONYMOUS_IF_EXISTS = "anonymous-if-exists[deprecated]" as const;
+const HOSTED_NETWORKING_ENABLED = false;
 
-export const dynamic = "force-dynamic";
 
 export async function generateMetadata({
   params,
@@ -68,7 +66,7 @@ export async function generateMetadata({
     contentLocale,
     t,
     siteMeta,
-    SHOW_VAULT ? "metaDescription" : "metaDescriptionNoVault",
+    isVaultEnabled() ? "metaDescription" : "metaDescriptionNoVault",
   );
   const alternates = buildAlternates(
     contentLocale,
@@ -100,7 +98,7 @@ export default async function PricingPage({
   const query = searchParams ? await searchParams : {};
   const t = await getTranslations({ locale, namespace: "pricing" });
   const snapshot = await currentPlanSnapshot();
-  const interval = proBillingInterval(firstParam(query.interval));
+  const interval = proBillingInterval(firstParam(query.interval) ?? "year");
   const proCheckoutHrefs = {
     month: withCheckoutInterval(PRO_CHECKOUT_URL, "month"),
     year: withCheckoutInterval(PRO_CHECKOUT_URL, "year"),
@@ -123,16 +121,26 @@ export default async function PricingPage({
   const proBaseFeatures = t.raw("pro.features") as string[];
   const proVaultFeatures = t.raw("pro.vaultFeatures") as string[];
   const proNetworkingFeatures = t.raw("pro.hostedNetworkingFeatures") as string[];
+  const featureVisibility = {
+    vault: isVaultEnabled(),
+    hostedNetworking: HOSTED_NETWORKING_ENABLED,
+  };
   const proFeatures = visibleProFeatures({
     base: proBaseFeatures,
     vault: proVaultFeatures,
     hostedNetworking: proNetworkingFeatures,
+    visibility: featureVisibility,
   });
   const teamFeatures = t.raw("team.features") as string[];
   const enterpriseFeatures = t.raw("enterprise.features") as string[];
-  const compareRows = visibleCompareRows(t.raw("compare.rows") as CompareRow[]);
-  const sizeRows = t.raw("sizes.rows") as SizeRow[];
-  const faqItems = visibleFaqItems(t.raw("faq.items") as FaqItem[]);
+  const compareRows = visibleCompareRows(
+    t.raw("compare.rows") as CompareRow[],
+    featureVisibility,
+  );
+  const faqItems = visibleFaqItems(
+    t.raw("faq.items") as FaqItem[],
+    featureVisibility,
+  );
 
   const linkClass =
     "underline underline-offset-2 decoration-link-underline hover:decoration-foreground transition-colors";
@@ -204,7 +212,7 @@ export default async function PricingPage({
                   </SecondaryLink>
                 </div>
               ) : (
-                <ProCtaLink checkoutHrefs={proCheckoutHrefs}>
+                <ProCtaLink checkoutHrefs={proCheckoutHrefs} size="compact">
                   {t("pro.cta")}
                 </ProCtaLink>
               )}
@@ -232,6 +240,7 @@ export default async function PricingPage({
                 hrefs={teamCheckoutHrefs}
                 location="pricing_page"
                 plan="team"
+                size="compact"
               >
                 {t("team.cta")}
               </PricingCheckoutButton>
@@ -320,16 +329,6 @@ export default async function PricingPage({
             />
           </section>
         </PricingIntervalProvider>
-
-        {/* Cloud VM sizes */}
-        <PricingSizeTable
-          rows={sizeRows}
-          title={t("sizes.title")}
-          body={t("sizes.body")}
-          colSize={t("sizes.colSize")}
-          colUse={t("sizes.colUse")}
-          colRate={t("sizes.colRate")}
-        />
 
         {/* FAQ */}
         <section className="mt-16 border-t border-border pt-10">
