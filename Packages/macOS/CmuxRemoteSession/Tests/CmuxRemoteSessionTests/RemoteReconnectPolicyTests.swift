@@ -212,7 +212,7 @@ struct RemoteReconnectPolicyTests {
             coordinator.isSystemSleeping = true
             coordinator.reconnectRetryCount = 8
             coordinator.consecutiveUnreachableProbeCount = policy.maxConsecutiveUnreachableProbes
-            coordinator.reconnectSuspended = true
+            coordinator.parkedState = RemoteSessionParkedState(cause: .hostUnreachable, detail: "test")
         }
 
         coordinator.resetReconnectPolicyAndReconnect(reason: "test wake")
@@ -269,7 +269,7 @@ struct RemoteReconnectPolicyTests {
         let panelID = UUID()
         coordinator.queue.sync {
             coordinator.isSystemSleeping = true
-            coordinator.reconnectSuspended = true
+            coordinator.parkedState = RemoteSessionParkedState(cause: .hostUnreachable, detail: "test")
             coordinator.remotePortScanGeneration = 7
             coordinator.remotePortScanBurstActive = true
             coordinator.remotePortScanActiveReason = .command
@@ -384,7 +384,7 @@ struct RemoteReconnectPolicyTests {
             coordinator.daemonReady = true
             coordinator.proxyEndpoint = BrowserProxyEndpoint(host: "127.0.0.1", port: 41_414)
             coordinator.reconnectRetryCount = 0
-            coordinator.reconnectSuspended = false
+            coordinator.parkedState = nil
         }
 
         coordinator.resetReconnectPolicyAndReconnect(reason: "system wake")
@@ -455,7 +455,7 @@ struct RemoteReconnectPolicyTests {
             provider.tunnel.stop()
         }
         coordinator.queue.sync {
-            coordinator.reconnectSuspended = true
+            coordinator.parkedState = RemoteSessionParkedState(cause: .hostUnreachable, detail: "suspended")
             coordinator.daemonReady = false
             coordinator.proxyEndpoint = nil
             coordinator.consecutiveUnreachableProbeCount = policy.maxConsecutiveUnreachableProbes
@@ -491,7 +491,7 @@ struct RemoteReconnectPolicyTests {
             provider.tunnel.stop()
         }
         coordinator.queue.sync {
-            coordinator.reconnectSuspended = true
+            coordinator.parkedState = RemoteSessionParkedState(cause: .hostUnreachable, detail: "suspended")
             coordinator.handleSuspendedReachabilityProbeOutcomeLocked(
                 .unreachable(reason: "no route"),
                 generation: coordinator.reachabilityProbeGeneration
@@ -537,7 +537,10 @@ struct RemoteReconnectPolicyTests {
             buildInfo: IntentionalCleanupBuildInfo(),
             daemonStrings: RemoteDaemonStrings(
                 missingPersistentPTYCapability: "",
-                missingRequiredFunctionality: ""
+                missingRequiredFunctionality: "",
+                cloudNotificationClearWorkspaceInvalid: "",
+                cloudNotificationClearWorkspaceDenied: "",
+                cloudNotificationClearSurfaceInvalid: ""
             ),
             strings: RemoteSessionStrings(
                 connectedVMNoProxyFormat: "%@",

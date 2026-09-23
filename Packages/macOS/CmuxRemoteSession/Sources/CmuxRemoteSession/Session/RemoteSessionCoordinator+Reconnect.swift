@@ -139,15 +139,12 @@ extension RemoteSessionCoordinator {
     /// `workspace.remote.reconnect` socket command) still replaces this
     /// coordinator immediately.
     func suspendAutoReconnectLocked() {
-        cancelReconnectRetryLocked()
-        reconnectSuspended = true
         debugLog(
             "remote.session.reconnect.suspended afterUnreachableProbes=\(consecutiveUnreachableProbeCount) " +
             debugConfigSummary()
         )
         let detail = String(format: strings.suspendedDetailFormat, configuration.displayTarget)
-        publishDaemonStatus(.unavailable, detail: detail)
-        publishState(.suspended, detail: detail)
+        parkSessionLocked(cause: .hostUnreachable, daemonState: .unavailable, detail: detail)
         scheduleSuspendedReachabilityProbeLocked()
     }
 

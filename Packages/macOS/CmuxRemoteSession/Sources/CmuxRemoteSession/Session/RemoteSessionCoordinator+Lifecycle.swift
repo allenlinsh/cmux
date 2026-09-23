@@ -22,7 +22,7 @@ extension RemoteSessionCoordinator {
         reconnectRetryCount = 0
         consecutiveUnreachableProbeCount = 0
         resetBootstrapFailureTrackingLocked()
-        reconnectSuspended = false
+        endReadinessSeekLocked()
         reconnectSuspendGraceUntil = nil
         reachabilityProbeGeneration &+= 1
         cancelControlMasterReapObservationLocked()
