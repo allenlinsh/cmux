@@ -97,9 +97,11 @@ done
 if [[ -n "$FORK_TEAM_ID" ]]; then
   ENTITLEMENTS_TMP="$(mktemp -t fork-entitlements).plist"
   codesign -d --entitlements "$ENTITLEMENTS_TMP" --xml "$APP" 2>/dev/null
-  SIGN_IDENTITY="$(security find-identity -v -p codesigning | awk -F'"' '/Apple Development/{print $2; exit}')"
+  # Re-sign with the identity Xcode used, so a second team's Apple Development
+  # cert in the keychain can't silently swap the team.
+  SIGN_IDENTITY="$(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=\(Apple Development: .*\)$/\1/p' | head -1)"
   if [[ -z "$SIGN_IDENTITY" ]]; then
-    echo "error: no valid Apple Development identity found to re-sign the bundle" >&2
+    echo "error: no Apple Development identity for team $FORK_TEAM_ID found to re-sign the bundle" >&2
     exit 1
   fi
   codesign --force --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS_TMP" "$APP"
