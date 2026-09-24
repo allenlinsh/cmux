@@ -1,0 +1,19 @@
+README.md
+  s_bbb8d9bdd3bdba::t_f37614715a76af 423-428,431-432,435-436,439-455,461-462,465-489,493-494,497-498,501-505,507,509,515-516
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "da050be0122026d67732eb97c89ed39cd463fa6a",
+  "prompts": {},
+  "sessions": {
+    "s_bbb8d9bdd3bdba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48207f5e-4bf8-4850-a275-ba315c1c3437",
+        "model": "unknown"
+      },
+      "human_author": "Allen Lin <allenlinsh@gmail.com>"
+    }
+  }
+}
