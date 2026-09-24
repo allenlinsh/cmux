@@ -1,0 +1,19 @@
+scripts/reload-fork.sh
+  s_bbb8d9bdd3bdba::t_b299973408842b 16-18,23-30,65-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8a5fd3a8c7d21b013ea36b52b3e1ce71990223e5",
+  "prompts": {},
+  "sessions": {
+    "s_bbb8d9bdd3bdba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "48207f5e-4bf8-4850-a275-ba315c1c3437",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Allen Lin <allenlinsh@gmail.com>"
+    }
+  }
+}
