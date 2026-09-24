@@ -13,17 +13,21 @@
 # CMUX_SKIP_ZIG_BUILD=1 is passed through if set (needed where zig 0.15.2 cannot
 # link against the host SDK; see scripts/build-ghostty-cli-helper.sh).
 #
-# Usage: ./scripts/reload-fork.sh [--install]
-#   --install  copy the built app to ~/Applications/"$FORK_APP_NAME.app"
+# Usage: ./scripts/reload-fork.sh [--install] [--allow-device-registration]
+#   --install                    copy the built app to ~/Applications/"$FORK_APP_NAME.app"
+#   --allow-device-registration  register this Mac with FORK_TEAM_ID (first build on a new team)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 INSTALL=0
-case "${1:-}" in
-  --install) INSTALL=1 ;;
-  "") ;;
-  *) echo "Unknown option: $1" >&2; exit 1 ;;
-esac
+ALLOW_DEVICE_REGISTRATION=0
+for arg in "$@"; do
+  case "$arg" in
+    --install) INSTALL=1 ;;
+    --allow-device-registration) ALLOW_DEVICE_REGISTRATION=1 ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
 
 if [[ -f .fork-config ]]; then
   # shellcheck disable=SC1091
@@ -58,6 +62,9 @@ if [[ -n "$FORK_TEAM_ID" ]]; then
     -allowProvisioningUpdates
     CODE_SIGN_ENTITLEMENTS=scripts/fork-dev.entitlements
   )
+  if [[ "$ALLOW_DEVICE_REGISTRATION" -eq 1 ]]; then
+    XCODEBUILD_ARGS+=(-allowProvisioningDeviceRegistration)
+  fi
 else
   echo "==> Release build with ad-hoc signing ($FORK_BUNDLE_ID); set FORK_TEAM_ID for a signed build"
   XCODEBUILD_ARGS+=(CODE_SIGN_ENTITLEMENTS="")
