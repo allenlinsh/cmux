@@ -198,7 +198,10 @@ BUILD_ARGS=(
   -configuration "$CONFIGURATION"
   -destination "$DESTINATION"
   -derivedDataPath "$DERIVED_DATA"
-  PRODUCT_BUNDLE_IDENTIFIER="$FORK_IOS_BUNDLE_ID"
+  # Set the base ids, not PRODUCT_BUNDLE_IDENTIFIER, so NotificationService keeps
+  # its "$(CMUX_HOST_BUNDLE_IDENTIFIER).NotificationService" suffix.
+  CMUX_APP_BUNDLE_IDENTIFIER="$FORK_IOS_BUNDLE_ID"
+  CMUX_HOST_BUNDLE_IDENTIFIER="$FORK_IOS_BUNDLE_ID"
   PRODUCT_DISPLAY_NAME="$FORK_IOS_APP_NAME"
   CODE_SIGN_STYLE=Automatic
   CODE_SIGN_ENTITLEMENTS="$ENTITLEMENTS"
@@ -260,11 +263,6 @@ if [[ ! -d "$APP_PATH" ]]; then
   echo "error: build succeeded but app not found at $APP_PATH" >&2
   exit 1
 fi
-
-# Apply display name post-build (global PRODUCT_NAME overrides break multi-target
-# builds; same pattern as scripts/reload-fork.sh).
-/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $FORK_IOS_APP_NAME" "$APP_PATH/Info.plist" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c "Set :CFBundleName $FORK_IOS_APP_NAME" "$APP_PATH/Info.plist" 2>/dev/null || true
 
 echo
 echo "App path:"
