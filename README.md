@@ -420,50 +420,100 @@ This is a personal fork (`allenlinsh/cmux`). Local **Release** builds must use
 `com.cmuxterm.*`, which is registered to Manaflow's Apple team, so it fails to
 sign in a fork.
 
-`reload-fork.sh` (and the iOS companion) read a gitignored `.fork-config` at the
-repo root:
+Builds sign with the **gtfol, LLC** Apple team (`J59ZSG67SJ`). It is a paid team,
+so development profiles last a year; a free personal team's profiles expire
+after 7 days.
+
+`reload-fork.sh` (and the iOS companion) read `.fork-config` at the repo root. It
+is not tracked; add it to `.git/info/exclude` in each clone:
 
 ```sh
-FORK_BUNDLE_ID=dev.you.cmux.staging   # your own namespace (never com.cmuxterm.*)
-FORK_TEAM_ID=XXXXXXXXXX               # your Apple team ID (optional on Mac for ad-hoc; required for iOS device)
+FORK_BUNDLE_ID=dev.gtfol.cmux         # never com.cmuxterm.* / dev.cmux.*
+FORK_TEAM_ID=J59ZSG67SJ               # gtfol, LLC
 FORK_APP_NAME="cmux fork"             # display name
 # optional iOS overrides:
-# FORK_IOS_BUNDLE_ID=dev.you.cmux.staging.ios   # default: ${FORK_BUNDLE_ID}.ios
-# FORK_IOS_APP_NAME="cmux fork"                 # default: $FORK_APP_NAME
+# FORK_IOS_BUNDLE_ID=dev.gtfol.cmux.ios   # default: ${FORK_BUNDLE_ID}.ios
+# FORK_IOS_APP_NAME="cmux fork"           # default: $FORK_APP_NAME
 ```
+
+App IDs can't move between teams, so switching `FORK_TEAM_ID` also needs a new
+bundle ID. A new bundle ID starts with fresh settings and pairing.
+
+### Prerequisites on a fresh clone
+
+- Xcode signed in to the gtfol team (Settings → Accounts), with an Apple
+  Development certificate for it.
+- Metal toolchain: `xcodebuild -downloadComponent MetalToolchain`.
+- `zig` (`brew install zig`); `scripts/ensure-ghosttykit.sh` requires it even
+  when prebuilt GhosttyKit is used.
+- Rust 1.88. Crates without a `rust-toolchain.toml` (for example `cmux-cua`)
+  use the rustup default, so either `rustup default 1.88.0` or prefix builds
+  with `RUSTUP_TOOLCHAIN=1.88.0`.
+- Submodules and GhosttyKit:
+  `git submodule update --init --recursive && ./scripts/download-prebuilt-ghosttykit.sh`
+  (or the full `./scripts/setup.sh`).
 
 ### Mac
 
 Build and install to `~/Applications/"$FORK_APP_NAME.app"`:
 
 ```sh
-CMUX_SKIP_ZIG_BUILD=1 ./scripts/reload-fork.sh --install
+RUSTUP_TOOLCHAIN=1.88.0 CMUX_GHOSTTYKIT_PREPROVISIONED=1 CMUX_SKIP_ZIG_BUILD=1 \
+  ./scripts/reload-fork.sh --install
 ```
 
-Drop `--install` to build without copying. `CMUX_SKIP_ZIG_BUILD=1` is required
-wherever zig 0.15.2 can't link against the host SDK. Debug builds still use
-`scripts/reload.sh --tag <name>` as usual.
+Drop `--install` to build without copying. On a Mac that isn't registered with
+the team yet, add `--allow-device-registration` to the first build. Debug
+builds still use `scripts/reload.sh --tag <name>` as usual.
+
+The first build on a new team can fail with `Build input file cannot be found:
+…/Provisioning Profiles/<uuid>.provisionprofile`. Xcode created the profile but
+hadn't written it yet; rerun the same command.
+
+### Running the Mac app on another Mac
+
+The development profile only lists registered Macs, so a copied app won't
+launch anywhere else until that Mac is in the profile:
+
+1. On the other Mac: `system_profiler SPHardwareDataType | grep "Provisioning UDID"`.
+2. Add that UDID in the Apple Developer portal (Certificates, IDs & Profiles →
+   Devices, platform macOS) under gtfol.
+3. On the build Mac, delete the cached team profile so Xcode fetches one with
+   the new device, then rebuild:
+   `rm ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/*.provisionprofile`
+4. Check the device list:
+   `security cms -D -i "$HOME/Applications/cmux fork.app/Contents/embedded.provisionprofile" | plutil -extract ProvisionedDevices json -o - -`
+5. Package with `ditto -c -k --keepParent "cmux fork.app" cmux-fork.zip`, copy it
+   over, move the app to `/Applications`, and clear the quarantine flag (the
+   build is not notarized, so Gatekeeper blocks it otherwise):
+   `xattr -dr com.apple.quarantine "/Applications/cmux fork.app"`
 
 ### iOS (physical device)
 
-Same `.fork-config`, then:
+Same `.fork-config` and prerequisites, then with the iPhone plugged in and
+**unlocked**:
 
 ```sh
-ios/scripts/reload-fork.sh
+RUSTUP_TOOLCHAIN=1.88.0 CMUX_GHOSTTYKIT_PREPROVISIONED=1 CMUX_SKIP_ZIG_BUILD=1 \
+  ios/scripts/reload-fork.sh --device-id <UDID> --allow-device-registration
 ```
 
+`--device-id` takes the hardware UDID (`xcrun xctrace list devices`), not the
+CoreDevice identifier `devicectl` prints. `--allow-device-registration` is
+only needed the first time a phone is used with the team. A locked phone fails
+with "The developer disk image could not be mounted"; unlock it and rerun.
+
 That builds a **Release** iOS app under `FORK_IOS_BUNDLE_ID` (default
-`${FORK_BUNDLE_ID}.ios`), signs with `FORK_TEAM_ID`, installs on a connected
+`${FORK_BUNDLE_ID}.ios`), signs with `FORK_TEAM_ID`, installs on the connected
 iPhone, and launches it. Fork entitlements strip Manaflow-only capabilities
-(Sign in with Apple / push) so a personal team can automatic-sign; email Stack
-sign-in and pairing still work.
+(Sign in with Apple / push); email Stack sign-in and pairing still work.
 
 This path is meant to pair with the Mac fork Release app (instance tag
 `default`). Do **not** mix it with `ios/scripts/reload.sh --tag …` (DEV tag
 channel) against a `reload-fork` Mac — those channels are incompatible.
 
-Useful flags: `--no-install`, `--no-launch`, `--simulator`, `--device-id <id>`,
-`--allow-device-registration`.
+Other flags: `--no-install`, `--no-launch`, `--simulator`.
+
 ## Contributing
 
 Ways to get involved:
